@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Bybit Scalper v11.1</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--card2:#0d1117;--line:#30363d;--green:#3fb950;--red:#f85149;--gray:#8b949e;--blue:#58a6ff;--orange:#d29922}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Tahoma,sans-serif;background:var(--bg);color:#c9d1d9;padding:15px;font-size:13px}
+.container{max-width:1600px;margin:0 auto}
+.header{background:var(--card);padding:15px 20px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;border:1px solid var(--line);flex-wrap:wrap;gap:10px}
+.header h1{font-size:clamp(15px,2.5vw,18px);color:var(--blue)}
+.badges{margin-top:5px;display:flex;gap:6px;flex-wrap:wrap}
+.status-badge{display:inline-block;padding:4px 10px;border-radius:4px;font-size:11px;font-weight:bold}
+.status-connected{background:#238636;color:#fff}.status-disconnected{background:#da3633;color:#fff}
+.status-trading{background:#1f6feb;color:#fff}.status-idle{background:#6e7681;color:#fff}
+.status-engine-ok{background:#1f6feb33;color:var(--blue);border:1px solid var(--blue)}
+.status-engine-bad{background:#da363333;color:var(--red);border:1px solid var(--red)}
+.btn-group{display:flex;gap:8px;flex-wrap:wrap}
+.btn{padding:9px 18px;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:12px;min-height:38px}
+.btn-sm{padding:5px 10px;min-height:26px;font-size:11px}
+.btn-start{background:#238636;color:#fff}.btn-stop{background:#da3633;color:#fff}
+.btn-notify{background:#6e7681;color:#fff}.btn-notify.on{background:var(--orange)}
+.btn-close{background:#da3633;color:#fff;padding:4px 10px;min-height:28px}
+.btn-refresh{background:#6e7681;color:#fff}.btn-export{background:#17a2b8;color:#fff}.btn-export2{background:#6f42c1;color:#fff}
+.tab-bar{display:flex;gap:8px;margin-bottom:15px;overflow-x:auto}
+.tab-btn{padding:10px 22px;border:1px solid var(--line);background:var(--card);color:var(--gray);border-radius:8px;cursor:pointer;font-weight:600;white-space:nowrap}
+.tab-btn.active{background:#1f6feb;color:#fff}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:15px}
+.stat-card{background:var(--card);padding:12px;border-radius:8px;border:1px solid var(--line);text-align:center}
+.stat-label{font-size:10px;color:var(--gray);text-transform:uppercase;margin-bottom:5px}
+.stat-value{font-size:clamp(15px,2.5vw,20px);font-weight:bold}
+.stat-sub{font-size:10px;color:var(--gray);margin-top:3px}
+.stat-positive{color:var(--green)}.stat-negative{color:var(--red)}
+.section{background:var(--card);padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid var(--line)}
+.section-title{font-size:14px;font-weight:600;color:var(--blue);margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.market-grid,.positions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px}
+.market-card,.position-card,.pending-card{background:var(--card2);padding:12px;border-radius:6px;border:1px solid var(--line)}
+.market-card.trend-up{border-left:4px solid var(--green)}
+.market-card.trend-down{border-left:4px solid var(--red)}
+.position-card.buy{border-left:4px solid var(--green)}.position-card.sell{border-left:4px solid var(--red)}
+.pending-card{border-left:4px solid var(--orange)}
+.market-header,.position-header,.pending-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap}
+.symbol{font-size:14px;font-weight:bold;color:#f0f6fc}
+.signal{padding:3px 8px;border-radius:3px;font-size:11px;font-weight:bold}
+.signal-BUY{background:#238636;color:#fff}.signal-SELL{background:#da3633;color:#fff}
+.signal-HOLD{background:#6e7681;color:#fff}.signal-PENDING{background:var(--orange);color:#0d1117}
+.price-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px;gap:8px;flex-wrap:wrap}
+.price{font-size:clamp(15px,2.5vw,18px);font-weight:bold}
+.price.up{color:var(--green)}.price.down{color:var(--red)}.price.flat{color:#f0f6fc}
+.price-info{font-size:11px;color:var(--gray)}
+.info-row{display:flex;justify-content:space-between;font-size:11px;color:var(--gray);margin-top:3px;gap:8px}
+.walls-indicator{display:inline-block;padding:2px 6px;background:var(--orange);color:#0d1117;border-radius:3px;font-weight:bold}
+.wall-line{font-size:10px;color:var(--orange);margin-top:3px}
+.bo-badge{font-size:10px;padding:2px 6px;border-radius:3px;background:#23863633;color:var(--green);border:1px solid var(--green);margin-top:4px;display:inline-block}
+.bo-badge.down{background:#da363333;color:var(--red);border-color:var(--red)}
+.status-line{margin-top:6px;font-size:11px;color:var(--blue)}
+.checks{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.checks span{font-size:9px;padding:1px 5px;border-radius:3px;background:#1c2128;color:var(--gray)}
+.checks span.ok{color:var(--green)}
+.checks span.bad{color:var(--red)}
+.strat-line{margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.strat-select{background:var(--card);border:1px solid var(--line);color:#c9d1d9;border-radius:4px;padding:4px 6px;font-size:11px}
+.strat-badge{font-size:10px;padding:2px 6px;border-radius:3px;background:#1f6feb33;color:var(--blue);border:1px solid var(--blue)}
+.position-side{font-weight:bold;padding:3px 8px;border-radius:3px;font-size:11px}
+.side-buy{background:#238636;color:#fff}.side-sell{background:#da3633;color:#fff}
+.pnl{font-size:16px;font-weight:bold}
+.position-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:5px;font-size:11px}
+.position-detail{color:var(--gray)}.position-detail strong{color:#c9d1d9}
+.pending-age{background:var(--orange);color:#0d1117;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold}
+.pending-reason{background:#1c2128;padding:6px 10px;border-radius:4px;font-size:11px;color:var(--orange);font-style:italic;margin-top:6px;border-left:2px solid var(--orange)}
+.pending-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:5px;font-size:11px}
+.empty-state{text-align:center;color:var(--gray);padding:20px;font-style:italic;grid-column:1/-1}
+.history-toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.chip{background:#1c2128;border:1px solid var(--line);border-radius:4px;padding:3px 8px;font-size:10px;color:var(--gray)}
+.chip b{color:#c9d1d9}
+.h-card{background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin-bottom:8px}
+.h-card.buy{border-left:4px solid var(--green)}.h-card.sell{border-left:4px solid var(--red)}
+.h-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.h-time{color:var(--gray);font-size:11px}
+.h-reason{background:#1c2128;padding:2px 8px;border-radius:3px;font-size:10px;color:var(--blue)}
+.h-head .pnl{margin-left:auto}
+.h-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:4px;font-size:11px;color:var(--gray)}
+.h-details strong{color:#c9d1d9}
+.prog{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:4px 0}
+.prog>div{height:100%;background:var(--blue)}
+#toast-container{position:fixed;top:15px;right:15px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:340px}
+.toast{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--blue);border-radius:6px;padding:10px 14px;animation:slideIn .3s ease}
+.toast.profit{border-left-color:var(--green)}.toast.loss{border-left-color:var(--red)}
+.toast.info{border-left-color:var(--orange)}
+.toast-title{font-weight:bold;font-size:13px;margin-bottom:3px;color:#f0f6fc}
+.toast-body{font-size:12px;color:var(--gray)}
+.toast.fade{opacity:0;transform:translateX(30px);transition:all .4s}
+@keyframes slideIn{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:translateX(0)}}
+.cfg-controls{margin-left:auto;display:flex;gap:6px;align-items:center}
+.cfg-input{background:var(--card);border:1px solid var(--line);color:#c9d1d9;border-radius:4px;padding:5px 8px;width:110px;font-size:12px}
+@media(max-width:640px){body{padding:8px}.header{flex-direction:column;align-items:stretch}.btn-group{width:100%}.btn-group .btn{flex:1;margin-left:0}.stats-grid{grid-template-columns:repeat(2,1fr)}.tab-btn{flex:1;text-align:center;padding:10px 12px}.positions-grid,.market-grid{grid-template-columns:1fr}.h-details{grid-template-columns:1fr}.h-head .pnl{margin-left:0;width:100%}#toast-container{left:8px;right:8px;max-width:none;top:8px}.history-toolbar .btn{flex:1}}
+</style>
+</head>
+<body>
+<div id="toast-container"></div>
+<div class="container">
+<div class="header">
+ <div><h1>🎯 Bybit Scalper v11.1 — Adaptive Analytics</h1>
+  <div class="badges">
+   <span id="ws-status" class="status-badge status-disconnected">🔴 Ожидание...</span>
+   <span id="trade-status" class="status-badge status-idle">⏸️ Остановлен</span>
+   <span id="engine-status" class="status-badge status-engine-ok">🫀 —</span>
+  </div></div>
+ <div class="btn-group">
+  <button id="btn-notify" class="btn btn-notify" onclick="toggleNotify()">🔕 Уведомления</button>
+  <button class="btn btn-start" onclick="sendCommand('start')">▶️ СТАРТ</button>
+  <button class="btn btn-stop" onclick="sendCommand('stop')">⏹️ СТОП</button>
+ </div>
+</div>
+<div class="stats-grid">
+ <div class="stat-card"><div class="stat-label">💰 Баланс</div><div class="stat-value" id="stat-balance">$500</div></div>
+ <div class="stat-card"><div class="stat-label">🔁 Сделок</div><div class="stat-value" id="stat-trades">0</div></div>
+ <div class="stat-card"><div class="stat-label">🎯 Winrate</div><div class="stat-value" id="stat-wr">0%</div><div class="stat-sub" id="stat-be"></div></div>
+ <div class="stat-card"><div class="stat-label">📊 Net PnL</div><div class="stat-value" id="stat-pnl">$0</div><div class="stat-sub" id="stat-pnl-pct"></div></div>
+ <div class="stat-card"><div class="stat-label">📅 Дневной PnL</div><div class="stat-value" id="stat-daily-pnl">$0</div><div class="stat-sub" id="stat-daily-pct"></div></div>
+</div>
+<div class="tab-bar">
+ <button class="tab-btn active" data-tab="trade" onclick="switchTab('trade')">📊 Торговля</button>
+ <button class="tab-btn" data-tab="history" onclick="switchTab('history')">📜 История</button>
+ <button class="tab-btn" data-tab="analytics" onclick="switchTab('analytics')">📈 Аналитика</button>
+ <button class="tab-btn" data-tab="adapt" onclick="switchTab('adapt')">🤖 Адаптация</button>
+ <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">⚙️ Настройки</button>
+</div>
+<div id="tab-trade">
+ <div class="section"><div class="section-title">📡 Мониторинг рынка и стен <span id="market-summary" style="color:#8b949e;font-size:12px"></span></div><div class="market-grid" id="market-grid"></div></div>
+ <div class="section"><div class="section-title">📈 Открытые позиции <span id="positions-count" style="color:#8b949e">(0)</span>
+   <button class="btn btn-close" style="margin-left:auto" onclick="closeAll()">✖ Закрыть все</button></div>
+  <div class="positions-grid" id="positions-list"></div><div class="empty-state" id="positions-empty">Нет открытых позиций</div></div>
+ <div class="section"><div class="section-title">🔄 Ожидающие лимитные ордера <span id="pending-count" style="color:#d29922">(0)</span></div>
+  <div class="positions-grid" id="pending-list"></div><div class="empty-state" id="pending-empty">Нет ожидающих ордеров</div></div>
+</div>
+<div id="tab-history" style="display:none">
+ <div class="section"><div class="history-toolbar">
+  <button class="btn btn-sm btn-export" onclick="exportTradesCSV()">⬇️ trades_export.csv</button>
+  <button class="btn btn-sm btn-export2" onclick="exportStatsCSV()">⬇️ stats_export.csv</button>
+  <button class="btn btn-sm btn-refresh" onclick="loadHistory(true)">🔄 Обновить</button></div>
+  <div id="history-summary"></div><div id="history-count" style="color:#8b949e;font-size:11px;margin-bottom:8px"></div>
+  <div id="history-list"></div>
+  <div style="text-align:center;margin-top:10px"><button class="btn btn-sm btn-refresh" id="btn-more" style="display:none" onclick="showMore()">Показать ещё ↓</button></div></div>
+</div>
+<div id="tab-analytics" style="display:none">
+ <div class="section"><div class="section-title">📈 Аналитика пар
+   <button class="btn btn-sm btn-refresh" style="margin-left:auto" onclick="loadAnalytics()">📊 Анализ сейчас</button>
+   <button class="btn btn-sm btn-close" onclick="fullReset()">♻️ Полный сброс</button></div>
+  <div id="analytics-body"></div></div>
+</div>
+<div id="tab-adapt" style="display:none">
+ <div class="section"><div class="section-title">🤖 Адаптация <span id="adapt-ver" class="chip"></span>
+   <button class="btn btn-sm btn-refresh" style="margin-left:auto" onclick="loadAdapt()">🔄 Обновить</button></div>
+  <div id="adapt-body"></div></div>
+</div>
+<div id="tab-settings" style="display:none">
+ <div class="section"><div class="history-toolbar"><button class="btn btn-sm btn-refresh" onclick="loadConfig()">🔄 Обновить</button>
+  <span style="color:#8b949e;font-size:12px">Изменения применяются сразу; «рестарт» — после перезапуска</span></div>
+  <div id="config-groups"></div></div>
+</div>
+</div>
+<script>
+let ws=null,notifEnabled=false,audioCtx=null,histCache=null,histAt=0,histShown=100,lastTrades=-1,analyticsTimer=null;
+const $=id=>document.getElementById(id);
+const pad=n=>String(n).padStart(2,'0');
+function formatPrice(p){if(p==null||isNaN(p))return '—';p=Number(p);
+ if(p>=1000)return '$'+p.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+ if(p>=1)return '$'+p.toLocaleString('en-US',{minimumFractionDigits:4,maximumFractionDigits:4});
+ return '$'+p.toLocaleString('en-US',{minimumFractionDigits:6,maximumFractionDigits:6})}
+function formatDuration(s){s=Math.floor(s||0);if(s<60)return s+'с';if(s<3600)return Math.floor(s/60)+'м '+(s%60)+'с';if(s<86400)return Math.floor(s/3600)+'ч '+Math.floor(s%3600/60)+'м';return Math.floor(s/86400)+'д'}
+function fmtDate(d){return pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())}
+function fmtDateTime(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
+function money(v){return (v>=0?'+$':'-$')+Math.abs(v).toFixed(2)}
+function cls(v){return v>0?'stat-positive':v<0?'stat-negative':''}
+function initAudio(){if(!audioCtx){try{audioCtx=new (window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(audioCtx&&audioCtx.state==='suspended')audioCtx.resume()}
+function beep(f,d){if(!audioCtx)return;try{const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.value=f;o.type='sine';o.connect(g);g.connect(audioCtx.destination);g.gain.setValueAtTime(.08,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(.0001,audioCtx.currentTime+(d||.15));o.start();o.stop(audioCtx.currentTime+(d||.15))}catch(e){}}
+function toggleNotify(){const b=$('btn-notify');if(!notifEnabled){notifEnabled=true;initAudio();if("Notification" in window&&Notification.permission==='default')Notification.requestPermission();b.textContent='🔔 Уведомления';b.classList.add('on');notify('🔔 Включено','Пуш + тосты + звук','info')}else{notifEnabled=false;b.textContent='🔕 Уведомления';b.classList.remove('on')}}
+function showToast(t,b,k){const c=$('toast-container'),e=document.createElement('div');e.className='toast '+(k||'info');e.innerHTML='<div class="toast-title">'+t+'</div><div class="toast-body">'+b+'</div>';c.appendChild(e);setTimeout(()=>{e.classList.add('fade');setTimeout(()=>e.remove(),400)},6000)}
+function notify(t,b,k){if(!notifEnabled)return;showToast(t,b,k);if(k==='profit')beep(880,.18);else if(k==='loss')beep(220,.25);else beep(520,.1);if("Notification" in window&&Notification.permission==='granted'){try{new Notification(t,{body:b})}catch(e){}}}
+function switchTab(n){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));
+ ['trade','history','analytics','adapt','settings'].forEach(t=>{$('tab-'+t).style.display=(t===n)?'block':'none'});
+ if(n==='history')loadHistory(false);if(n==='settings')loadConfig();if(n==='adapt')loadAdapt();
+ if(n==='analytics'){loadAnalytics();clearInterval(analyticsTimer);analyticsTimer=setInterval(()=>{if($('tab-analytics').style.display!=='none')loadAnalytics()},60000)}
+ else{clearInterval(analyticsTimer);analyticsTimer=null}}
+function connectWebSocket(){const proto=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(proto+'://'+location.host+'/ws');
+ ws.onopen=()=>{$('ws-status').className='status-badge status-connected';$('ws-status').textContent='🟢 Подключено'};
+ ws.onclose=()=>{$('ws-status').className='status-badge status-disconnected';$('ws-status').textContent='🔴 Отключено';setTimeout(connectWebSocket,3000)};
+ ws.onerror=()=>ws.close();
+ ws.onmessage=e=>{try{handle(JSON.parse(e.data))}catch(err){console.error(err)}}}
+function sendCommand(a){if(ws&&ws.readyState===1)ws.send(JSON.stringify({action:a}));fetch('/api/trading/'+a,{method:'POST'}).catch(()=>{})}
+function closePosition(key){fetch('/api/close/'+encodeURIComponent(key),{method:'POST'}).then(r=>r.json()).then(r=>{if(r.ok)notify('✖ Закрыто',key,'info');else showToast('Ошибка',r.error||'','loss')})}
+function closeAll(){fetch('/api/close_all',{method:'POST'}).then(r=>r.json()).then(r=>notify('✖ Закрыто всех',r.closed+' позиций','info'))}
+function cancelPending(id){fetch('/api/cancel_pending/'+id,{method:'POST'}).then(()=>showToast('⏰ Отменено','ордер '+id,'info'))}
+function setStrategy(sym,val){fetch('/api/pairs/'+sym,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy:val})}).then(()=>showToast('🎛️ '+sym,'стратегия: '+val+(val!=='AUTO'?' (🔒 locked)':''),'info'))}
+function rollback(v){if(!confirm('Откатить конфиг к v'+v+'?'))return;fetch('/api/config_rollback/'+v,{method:'POST'}).then(()=>showToast('↩️ Откат','к v'+v,'info'))}
+function fullReset(){if(!confirm('Полный сброс: баланс 500, история удалится (knowledge.db сохранится). Продолжить?'))return;fetch('/api/reset',{method:'POST'}).then(()=>{notify('♻️ Сброс','выполнен','info');loadHistory(true)})}
+function handle(data){
+ if(data.type==='state'){setTrading(!!data.is_trading)}
+ else if(data.type==='ack'){if(data.action==='start')setTrading(true);if(data.action==='stop')setTrading(false)}
+ else if(data.type==='ticker_update'){
+  if(data.health){const h=data.health,el=$('engine-status');const up=h.uptime_sec||0;
+   const upStr=up>=3600?Math.floor(up/3600)+'ч '+Math.floor(up%3600/60)+'м':up>=60?Math.floor(up/60)+'м '+up%60+'с':up+'с';
+   if(h.last_tick_age<3){el.className='status-badge status-engine-ok';el.textContent='🫀 жив | '+upStr}
+   else{el.className='status-badge status-engine-bad';el.textContent='🫀 ЗАВИС '+h.last_tick_age+'с'}}
+  if(data.stats){const s=data.stats;const b=$('stat-balance');b.textContent='$'+(s.virtual_balance||0).toFixed(2);b.className='stat-value '+cls((s.virtual_balance||0)-(s.initial_balance||0));
+   $('stat-trades').textContent=s.total_trades||0;const tot=(s.winning_trades||0)+(s.losing_trades||0);
+   $('stat-wr').textContent=(tot?((s.winning_trades||0)/tot*100):0).toFixed(1)+'%';
+   const be=$('stat-be');if(be)be.textContent='±0: '+(s.breakeven||0)+(s.total_trades?' ('+(((s.breakeven||0)/s.total_trades)*100).toFixed(0)+'%)':'');
+   const p=$('stat-pnl');p.textContent=money(s.total_pnl||0);p.className='stat-value '+cls(s.total_pnl||0);
+   const pp=$('stat-pnl-pct');if(pp&&s.initial_balance)pp.textContent=((s.total_pnl||0)/s.initial_balance*100).toFixed(1)+'% от старта';
+   const d=$('stat-daily-pnl');d.textContent=money(s.daily_pnl||0);d.className='stat-value '+cls(s.daily_pnl||0);
+   const dd=$('stat-daily-pct');if(dd){const st0=(s.virtual_balance||0)-(s.daily_pnl||0);dd.textContent=(st0?((s.daily_pnl||0)/st0*100).toFixed(1):'0.0')+'% за день';}
+   if(lastTrades>=0&&s.total_trades!==lastTrades){setTimeout(()=>loadHistory(true),800);if($('tab-analytics').style.display!=='none')setTimeout(()=>loadAnalytics(),800)}lastTrades=s.total_trades}
+  if(data.data){const items=Object.entries(data.data).map(([symbol,info])=>({symbol,info}));
+   reconcile($('market-grid'),items,it=>it.symbol,it=>createMarket(it.symbol),updateMarket);
+   const arr=Object.values(data.data);const rd=arr.filter(x=>(x.status||'').indexOf('✅')===0).length;
+   const ms=$('market-summary');if(ms)ms.textContent='готово '+rd+' из '+arr.length}
+  renderPositions(data.open_positions||[]);renderPending(data.pending_orders||[])}}
+function setTrading(v){const el=$('trade-status');if(v){el.className='status-badge status-trading';el.textContent='▶️ Торгуем'}else{el.className='status-badge status-idle';el.textContent='⏸️ Остановлен'}}
+function reconcile(container,items,keyFn,createFn,updateFn){const ex=new Map();Array.from(container.children).forEach(el=>{if(el.dataset&&el.dataset.key)ex.set(el.dataset.key,el)});
+ const seen=new Set();items.forEach(item=>{const key=String(keyFn(item));seen.add(key);let el=ex.get(key);if(!el){el=createFn(item);el.dataset.key=key;container.appendChild(el)}updateFn(el,item)});
+ ex.forEach((el,key)=>{if(!seen.has(key))el.remove()})}
+function createMarket(sym){const c=document.createElement('div');c.className='market-card';
+ c.innerHTML='<div class="market-header"><span class="symbol">'+sym+'</span><span class="signal signal-HOLD">HOLD</span></div>'+
+ '<div class="price-row"><span class="price flat">—</span><span class="price-info">Last: —</span></div>'+
+ '<div class="info-row"><span class="m-trend">➡️ —</span><span class="m-spread">Спред: —</span></div>'+
+ '<div class="info-row"><span class="m-atr">ATR: —</span><span><span class="walls-indicator m-walls">🧱 0</span></span></div>'+
+ '<div class="wall-line m-wall"></div><span class="bo-badge m-bo" style="display:none"></span>'+
+ '<div class="strat-line"><select class="strat-select m-strat" onchange="setStrategy(\''+sym+'\',this.value)">'+
+ ['AUTO','WALL','TREND','SWING','GRID','BREAKOUT','OFF'].map(s=>'<option value="'+s+'">'+s+'</option>').join('')+
+ '</select><span class="strat-badge m-active">—</span><span class="m-rec" style="font-size:10px;color:#8b949e"></span></div>'+
+ '<div class="status-line m-status"></div><div class="checks m-checks"></div>';return c}
+function updateMarket(el,it){const i=it.info;
+ const tr=i.trend||'UNKNOWN';
+ el.className='market-card '+(tr==='BULLISH'?'trend-up':tr==='BEARISH'?'trend-down':'');
+ const sig=el.querySelector('.signal');sig.className='signal signal-'+(i.signal||'HOLD');sig.textContent=i.signal||'HOLD';
+ const pr=el.querySelector('.price');pr.textContent=formatPrice(i.price);
+ pr.className='price '+(tr==='BULLISH'?'up':tr==='BEARISH'?'down':'flat');
+ el.querySelector('.price-info').textContent='Last: '+formatPrice(i.last_price);
+ el.querySelector('.m-trend').textContent=(tr==='BULLISH'?'▲':tr==='BEARISH'?'▼':'➡')+' '+tr+(i.cooldown>0?' | ⏳'+i.cooldown+'с':'');
+ el.querySelector('.m-spread').textContent='Спред: '+(((i.spread_pct||0))*100).toFixed(3)+'%';
+ el.querySelector('.m-atr').textContent='ATR: '+(((i.atr_pct||0))*100).toFixed(3)+'%';
+ el.querySelector('.m-walls').textContent='🧱 '+(i.valid_walls||0);
+ el.querySelector('.m-wall').textContent=(i.walls||[]).map(w=>(w.side==='bid'?'🟢':'')+' '+formatPrice(w.price)+' ×'+w.volume+' ('+w.age+'с)').join('  ');
+ const bo=el.querySelector('.m-bo');
+ if(i.breakout&&i.breakout.active){bo.style.display='inline-block';bo.className='bo-badge'+(i.breakout.side==='Sell'?' down':'');
+  bo.textContent='🚀 BREAKOUT '+(i.breakout.side==='Buy'?'↑':'↓')+' диапазон '+(i.breakout.range_pct*100).toFixed(1)+'% объём ×'+i.breakout.vol_ratio}
+ else bo.style.display='none';
+ const sel=el.querySelector('.m-strat');if(document.activeElement!==sel)sel.value=i.strat_set||'AUTO';
+ el.querySelector('.m-active').textContent='актив: '+(i.strat_active||'—');
+ el.querySelector('.m-rec').textContent='auto: '+(i.rec_reason||'');
+ el.querySelector('.m-status').textContent=i.status||'';
+ el.querySelector('.m-checks').innerHTML=(i.checks||[]).map(c=>'<span class="'+(c.ok?'ok':'bad')+'">'+(c.ok?'✓':'✗')+' '+c.l+'</span>').join('')}
+function renderPositions(list){$('positions-count').textContent='('+list.length+')';$('positions-empty').style.display=list.length?'none':'block';
+ reconcile($('positions-list'),list,p=>p.key,p=>createPosition(p),updatePosition)}
+function createPosition(p){const c=document.createElement('div');c.className='position-card '+(p.side==='Buy'?'buy':'sell');
+ c.innerHTML='<div class="position-header"><div><span class="symbol" style="margin-right:8px">'+p.symbol+'</span>'+
+ '<span class="position-side '+(p.side==='Buy'?'side-buy':'side-sell')+'">'+(p.side==='Buy'?'🟢 LONG':' SHORT')+'</span>'+
+ '<span class="strat-badge d-strat"></span></div><div style="display:flex;gap:6px;align-items:center"><span class="pnl">—</span>'+
+ '<button class="btn btn-close" onclick="closePosition(\''+p.key+'\')">✖</button></div></div>'+
+ '<div class="position-details"><div class="position-detail d-entry"></div><div class="position-detail d-now"></div>'+
+ '<div class="position-detail d-qty"></div><div class="position-detail d-time"></div>'+
+ '<div class="position-detail d-tp"></div><div class="position-detail d-sl"></div>'+
+ '<div class="position-detail d-margin"></div><div class="position-detail d-notional"></div></div>';return c}
+function updatePosition(el,p){const pnl=p.current_pnl||0;const e=el.querySelector('.pnl');e.textContent=money(pnl);e.className='pnl '+cls(pnl);
+ el.querySelector('.d-strat').textContent=p.strategy;
+ el.querySelector('.d-entry').innerHTML='<strong>Вход:</strong> '+formatPrice(p.entry_price);
+ el.querySelector('.d-now').innerHTML='<strong>Сейчас:</strong> '+formatPrice(p.current_price);
+ el.querySelector('.d-qty').innerHTML='<strong>Кол-во:</strong> '+p.qty;
+ el.querySelector('.d-time').innerHTML='<strong>Время:</strong> '+formatDuration(p.hold_time_sec);
+ el.querySelector('.d-tp').innerHTML='<span style="color:#3fb950"><strong>TP:</strong> '+formatPrice(p.tp_price)+'</span>';
+ el.querySelector('.d-sl').innerHTML='<span style="color:#f85149"><strong>SL:</strong> '+formatPrice(p.sl_price)+'</span>';
+ el.querySelector('.d-margin').innerHTML='<strong>Маржа:</strong> $'+(p.margin_used||0).toFixed(2);
+ el.querySelector('.d-notional').innerHTML='<strong>Нотация:</strong> $'+(p.notional||0).toFixed(0)}
+function renderPending(list){$('pending-count').textContent='('+list.length+')';$('pending-empty').style.display=list.length?'none':'block';
+ reconcile($('pending-list'),list,po=>po.order_id,po=>createPending(po),updatePending)}
+function createPending(po){const c=document.createElement('div');c.className='pending-card';
+ c.innerHTML='<div class="pending-header"><div><span class="symbol" style="margin-right:8px">'+po.symbol+'</span>'+
+ '<span class="position-side '+(po.side==='Buy'?'side-buy':'side-sell')+'">'+(po.side==='Buy'?'🟢 BUY':'🔴 SELL')+'</span>'+
+ '<span class="strat-badge">'+po.strategy+'</span></div><div style="display:flex;gap:6px;align-items:center"><span class="pending-age">⏳ 0с</span>'+
+ '<button class="btn btn-close" onclick="cancelPending('+po.order_id+')">✖</button></div></div>'+
+ '<div class="pending-details"><div class="position-detail d-price"></div><div class="position-detail d-qty"></div>'+
+ '<div class="position-detail d-tp"></div><div class="position-detail d-sl"></div></div>'+
+ '<div class="pending-reason">💡 '+(po.reason||'')+'</div>';return c}
+function updatePending(el,po){el.querySelector('.pending-age').textContent='⏳ '+(po.age_sec||0)+'с';
+ el.querySelector('.d-price').innerHTML='<strong>Цена:</strong> '+formatPrice(po.price);
+ el.querySelector('.d-qty').innerHTML='<strong>Кол-во:</strong> '+po.qty;
+ el.querySelector('.d-tp').innerHTML='<strong>TP:</strong> '+formatPrice(po.tp_price);
+ el.querySelector('.d-sl').innerHTML='<strong>SL:</strong> '+formatPrice(po.sl_price)}
+function loadHistory(force){if(!force&&histCache&&(Date.now()-histAt)<30000){renderHistory();return}
+ fetch('/api/trades?limit=1000').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(tr=>{histCache=tr||[];histAt=Date.now();histShown=100;renderHistory()}).catch(e=>console.error(e))}
+function showMore(){histShown+=100;renderHistory()}
+function aggRows(rows){const n=rows.length;const w=rows.filter(r=>(r.pnl||0)>0).length;
+ const net=rows.reduce((s,r)=>s+(r.pnl||0),0);const gross=rows.reduce((s,r)=>s+(r.gross_pnl||0),0);
+ const comm=rows.reduce((s,r)=>s+((r.gross_pnl||0)-(r.pnl||0)),0);
+ const dur=n?rows.reduce((s,r)=>s+(((r.exit_timestamp||r.timestamp)-r.timestamp)),0)/n:0;
+ const best=n?Math.max.apply(null,rows.map(r=>r.pnl||0)):0;const worst=n?Math.min.apply(null,rows.map(r=>r.pnl||0)):0;
+ const be=rows.filter(r=>(r.gross_pnl||0)>0&&(r.pnl||0)<=0).length;
+ return{n,w,wr:n?w/n*100:0,net,gross,comm,dur,best,worst,be}}
+function renderHistory(){const list=$('history-list');const t=histCache||[];const a=aggRows(t);
+ $('history-summary').innerHTML='<div class="chips">'+
+  '<span class="chip">Сделок <b>'+a.n+'</b></span><span class="chip">WR <b>'+a.wr.toFixed(1)+'%</b></span>'+
+  '<span class="chip">Net <b>'+money(a.net)+'</b></span><span class="chip">Gross <b>'+money(a.gross)+'</b></span>'+
+  '<span class="chip">Комиссии <b>$'+a.comm.toFixed(2)+'</b></span><span class="chip">±0 <b>'+a.be+'</b></span></div>';
+ $('history-count').textContent='(показано '+Math.min(histShown,t.length)+' из '+t.length+')';
+ list.innerHTML=t.slice(0,histShown).map(hRow).join('')||'<div class="empty-state">Нет сделок</div>';
+ $('btn-more').style.display=(t.length>histShown)?'inline-block':'none'}
+function hRow(t){const net=t.pnl||0,gross=t.gross_pnl||0,fees=gross-net;const d=new Date(t.timestamp*1000);
+ const dur=(t.exit_timestamp&&t.exit_timestamp>t.timestamp)?(t.exit_timestamp-t.timestamp):0;
+ const notional=(t.qty||0)*(t.entry_price||0);const long=t.side==='Buy';
+ const dpc=long?((t.exit_price-t.entry_price)/t.entry_price*100):((t.entry_price-t.exit_price)/t.entry_price*100);
+ return '<div class="h-card '+(long?'buy':'sell')+'"><div class="h-head"><span class="h-time">'+fmtDate(d)+'</span>'+
+ '<span class="symbol">'+t.symbol+'</span><span class="position-side '+(long?'side-buy':'side-sell')+'">'+(long?'🟢 LONG':' SHORT')+'</span>'+
+ '<span class="h-reason">'+(t.exit_reason||'')+'</span><span class="h-reason">'+(t.strategy||'')+'</span>'+
+ '<span class="pnl '+cls(net)+'">'+money(net)+'</span></div>'+
+ '<div class="h-details"><div>Вход: <strong>'+formatPrice(t.entry_price)+'</strong> → Выход: <strong>'+formatPrice(t.exit_price)+'</strong> | Δ '+dpc.toFixed(2)+'%</div>'+
+ '<div>⏱️ '+formatDuration(dur)+' | Маржа: $'+(t.margin_used||0).toFixed(2)+' | Нотация: $'+notional.toFixed(0)+'</div>'+
+ '<div>Gross: '+money(gross)+' | Комиссия: $'+fees.toFixed(2)+' | Net: '+money(net)+'</div>'+
+ '<div>MFE: '+((t.mfe||0)).toFixed(2)+'% | MAE: '+((t.mae||0)).toFixed(2)+'% | TP: '+formatPrice(t.initial_tp)+' | SL: '+formatPrice(t.initial_sl)+(t.wall_price?' | 🧱 '+formatPrice(t.wall_price):'')+'</div></div></div>'}
+function loadAnalytics(){fetch('/api/analytics').then(r=>r.json()).then(renderAnalytics).catch(e=>{$('analytics-body').innerHTML='<div class="empty-state">Ошибка загрузки</div>'})}
+function renderAnalytics(a){let html='<div class="h-card"><div class="h-head"><span class="symbol">💼 Счёт</span>'+
+ '<span class="strat-badge">config v'+(a.account.version||0)+'</span>'+
+ '<span class="pnl '+cls(a.account.total_pnl)+'">'+money(a.account.total_pnl)+'</span></div>'+
+ '<div class="h-details"><div>Баланс: <strong>$'+a.account.balance+'</strong> | ±0: '+(a.account.breakeven||0)+'</div>'+
+ '<div>По дням: '+(a.daily||[]).map(d=>d.date.slice(5)+': '+money(d.net)).join(' | ')+'</div></div></div>';
+ for(const[sym,p]of Object.entries(a.pairs)){const m=p.metrics||{};const r=p.regime||{};const bo=p.breakout||{};
+  let perfHtml=Object.entries(p.perf||{}).map(([s,pm])=>s+': '+pm.n+'сд WR'+pm.wr+'% '+money(pm.net)).join(' | ')||'—';
+  html+='<div class="h-card"><div class="h-head"><span class="symbol">'+sym+'</span>'+
+  '<span class="strat-badge">актив: '+(p.active_strat||'—')+'</span><span class="h-reason">set: '+(p.set||'AUTO')+'</span>'+
+  '<span class="pnl '+cls(m.net||0)+'">'+money(m.net||0)+'</span></div>'+
+  '<div class="prog"><div style="width:'+(p.progress||0)+'%"></div></div>'+
+  '<div class="h-details">'+
+  '<div>📊 Выборка: <strong>'+(m.n||0)+'</strong> (72ч) | WR '+(m.wr||0)+'% | ±0: '+(m.breakeven||0)+'</div>'+
+  '<div>Gross: '+money(m.gross||0)+' | Комиссии: $'+(m.fees||0).toFixed(2)+' | Fee/Gross: '+(m.gross?(m.fees/m.gross).toFixed(1):'—')+'×</div>'+
+  '<div>MFE ср: '+((m.avg_mfe||0)*100).toFixed(2)+'% | MAE ср: '+((m.avg_mae||0)*100).toFixed(2)+'% | inst-stop: '+(m.inst_stop||0)+'</div>'+
+  '<div>Buy gross: '+money(m.buy_gross||0)+' | Sell gross: '+money(m.sell_gross||0)+'</div>'+
+  '<div>🧭 Режим: vol_rel '+(r.vol_rel||0)+' | trend '+(r.trendiness||0)+' | стены '+(r.wall_share||0)+'</div>'+
+  '<div>🚀 BREAKOUT: '+(bo.active?('АКТИВЕН '+(bo.side==='Buy'?'↑':'↓')+' '+(bo.range_pct*100).toFixed(1)+'% ×'+bo.vol_ratio):'нет')+'</div>'+
+  '<div>🕐 Худшие часы: '+(p.hours||[]).map(h=>h.h+':00('+money(h.net)+')').join(' ')+'</div>'+
+  '<div>🏆 По стратегиям: '+perfHtml+'</div>'+
+  '<div>🎯 Рекомендация: <strong>'+(p.recommendation||'—')+'</strong> — '+(p.rec_reason||'')+'</div></div></div>'}
+ $('analytics-body').innerHTML=html}
+function loadAdapt(){fetch('/api/adapter').then(r=>r.json()).then(renderAdapt).catch(e=>{$('adapt-body').innerHTML='<div class="empty-state">Ошибка загрузки</div>'})}
+function renderAdapt(d){$('adapt-ver').textContent='config v'+(d.version||0);let h='';
+ for(const[s,p]of Object.entries(d.pairs)){const dec=p.decision||{};
+  h+='<div class="h-card"><div class="h-head"><span class="symbol">'+s+'</span>'+
+  '<select class="strat-select" onchange="setStrategy(\''+s+'\',this.value)">'+
+  ['AUTO','WALL','TREND','SWING','GRID','BREAKOUT','OFF'].map(x=>'<option '+(x===(p.set||'AUTO')?'selected':'')+' value="'+x+'">'+x+'</option>').join('')+'</select>'+
+  (p.locked?'<span class="h-reason">🔒 manual</span>':'')+
+  (p.canary?'<span class="h-reason">🐣 ×'+p.canary+'</span>':'')+
+  '<span class="strat-badge">актив: '+(p.adapter_strategy||p.set||'—')+'</span></div>'+
+  '<div class="h-details"><div>risk_mult: <b>'+(p.risk_mult!=null?p.risk_mult:1)+'</b></div>'+
+  '<div>Решение: <b>'+(dec.strategy||'—')+'</b> ×'+(dec.risk_mult!=null?dec.risk_mult:'—')+' — '+(dec.reason||'')+'</div>'+
+  '<div>'+(dec.ts?('🕐 '+new Date(dec.ts*1000).toLocaleString()):'')+'</div></div></div>'}
+ h+='<div class="h-card"><div class="h-head"><span class="symbol">📜 Журнал адаптера</span></div>'+
+  (d.log&&d.log.length?d.log.map(l=>'<div class="h-details"><div>'+new Date(l.ts*1000).toLocaleString()+' | '+l.symbol+' | '+l.param+': '+l.old+'→'+l.new+' ('+l.reason+')</div></div>').join(''):'<div class="empty-state">Пока пусто</div>')+'</div>';
+ h+='<div class="h-card"><div class="h-head"><span class="symbol">🕘 Версии конфига</span></div>'+
+  (d.versions&&d.versions.length?d.versions.map(v=>'<div class="h-details"><div>v'+v.version+' | '+new Date(v.ts*1000).toLocaleString()+' | '+v.note+' <button class="btn btn-sm btn-refresh" onclick="rollback('+v.version+')">↩️</button></div></div>').join(''):'<div class="empty-state">Пока пусто</div>')+'</div>';
+ $('adapt-body').innerHTML=h}
+function loadConfig(){fetch('/api/config').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(renderConfig).catch(e=>{$('config-groups').innerHTML='<div class="empty-state">⚠️ '+e.message+'</div>'})}
+function renderConfig(cfg){const groups={};for(const[k,m]of Object.entries(cfg)){if(typeof m!=='object'||!m)continue;(groups[m.group]=groups[m.group]||[]).push([k,m])}
+ const root=$('config-groups');root.innerHTML='';for(const[g,items]of Object.entries(groups)){const sec=document.createElement('div');sec.className='section';
+ sec.innerHTML='<div class="section-title">'+g+'</div>';items.forEach(([k,m])=>sec.appendChild(configRow(k,m)));root.appendChild(sec)}}
+function configRow(key,m){const row=document.createElement('div');row.className='h-card';
+ const badge=m.restart?' <span class="h-reason" style="color:#d29922">рестарт</span>':'';
+ row.innerHTML='<div class="h-head"><span class="symbol">'+key+'</span>'+badge+'<span class="cfg-controls"></span></div>'+
+ '<details style="margin-top:4px"><summary style="cursor:pointer;color:#8b949e;font-size:11px">описание</summary>'+
+ '<ul style="margin:6px 0 0 18px;color:#8b949e;font-size:11px"><li>'+m.desc+'</li>'+
+ '<li>Тип: '+m.type+(m.min!=null?' | Мин: '+m.min:'')+(m.max!=null?' | Макс: '+m.max:'')+'</li>'+
+ '<li>Текущее: '+(m.type==='list'?(m.value||[]).join(', '):m.value)+'</li></ul></details>';
+ const ctrl=row.querySelector('.cfg-controls');let input;
+ if(m.type==='bool'){input=document.createElement('input');input.type='checkbox';input.checked=!!m.value}
+ else if(m.type==='list'){input=document.createElement('input');input.type='text';input.className='cfg-input';input.style.width='220px';input.value=(m.value||[]).join(', ')}
+ else{input=document.createElement('input');input.type='number';input.className='cfg-input';input.value=m.value;if(m.step!=null)input.step=m.step;if(m.min!=null)input.min=m.min;if(m.max!=null)input.max=m.max}
+ ctrl.appendChild(input);
+ const btn=document.createElement('button');btn.className='btn btn-sm btn-refresh';btn.textContent='💾';
+ btn.onclick=()=>saveConfig(key,m,input);ctrl.appendChild(btn);return row}
+function saveConfig(key,m,input){let value;
+ if(m.type==='bool')value=input.checked;
+ else if(m.type==='list')value=input.value.split(',').map(s=>s.trim()).filter(Boolean);
+ else value=parseFloat(input.value);
+ fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[key]:value})})
+ .then(r=>r.json()).then(res=>{if(res.ok){showToast('Сохранено',key+' = '+JSON.stringify(value),'info');if(res.restart_required&&res.restart_required.length)showToast('Нужен рестарт',res.restart_required.join(', '),'info')}else showToast('Ошибка',res.detail||'','loss')}).catch(()=>showToast('Ошибка','','loss'))}
+function downloadCSV(fn,text){const blob=new Blob(["\uFEFF"+text],{type:'text/csv;charset=utf-8;'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fn;a.click();URL.revokeObjectURL(a.href);notify('⬇️ Экспорт',fn,'info')}
+function exportTradesCSV(){if(!histCache||!histCache.length){alert('Нет данных');return}
+ const L=['Время;Пара;Сторона;Цена входа;Цена выхода;Длит.(сек);Длительность;Маржа;Net PnL;Gross PnL;Причина;Тренд;Стена;Стратегия;MFE%;MAE%'];
+ histCache.forEach(t=>{const d=new Date(t.timestamp*1000);const dur=(t.exit_timestamp&&t.exit_timestamp>t.timestamp)?(t.exit_timestamp-t.timestamp):0;
+  L.push([fmtDateTime(d),t.symbol,t.side,(t.entry_price||0).toFixed(6),(t.exit_price||0).toFixed(6),dur.toFixed(1),formatDuration(dur),(t.margin_used||0).toFixed(2),(t.pnl||0).toFixed(4),(t.gross_pnl||0).toFixed(4),t.exit_reason||'',t.entry_trend||'',(t.wall_price||0).toFixed(6),t.strategy||'',((t.mfe||0)).toFixed(2),((t.mae||0)).toFixed(2)].join(';'))});
+ downloadCSV('trades_export.csv',L.join('\n'))}
+function exportStatsCSV(){if(!histCache||!histCache.length){alert('Нет данных');return}
+ const t=histCache,f=x=>x.toFixed(4),L=[];const a=aggRows(t);
+ L.push('=== ОБЩАЯ СТАТИСТИКА ===','Метрика;Значение','Всего сделок;'+a.n,'Побед;'+a.w,'Поражений;'+(a.n-a.w),
+ 'Winrate;'+a.wr.toFixed(1)+'%','Net PnL;'+f(a.net),'Gross PnL;'+f(a.gross),'Комиссии всего;'+f(a.comm),'±0 сделок;'+a.be,
+ 'Средняя длительность (сек);'+a.dur.toFixed(1),'Лучшая сделка;'+f(a.best),'Худшая сделка;'+f(a.worst));
+ function group(keyFn,title,header,rowFn){const map={};t.forEach(r=>{const k=keyFn(r);(map[k]=map[k]||[]).push(r)});
+  L.push('',title,header);Object.keys(map).sort().forEach(k=>rowFn(k,aggRows(map[k])))}
+ group(r=>r.symbol,'=== ПО ПАРАМ ===','Пара;Сделок;Побед;Поражений;Winrate;Net PnL;Gross PnL;Комиссии;Ср.длит(сек);Лучшая;Худшая',
+  (k,a)=>L.push([k,a.n,a.w,a.n-a.w,a.wr.toFixed(1)+'%',f(a.net),f(a.gross),f(a.comm),a.dur.toFixed(1),f(a.best),f(a.worst)].join(';')));
+ group(r=>r.strategy||'—','=== ПО СТРАТЕГИЯМ ===','Стратегия;Сделок;Побед;Winrate;Net PnL;Gross PnL;Комиссии',
+  (k,a)=>L.push([k,a.n,a.w,a.wr.toFixed(1)+'%',f(a.net),f(a.gross),f(a.comm)].join(';')));
+ group(r=>r.entry_trend||'—','=== ПО ТРЕНДАМ ===','Тренд;Сделок;Побед;Поражений;Winrate;Net PnL;Gross PnL;Комиссии',
+  (k,a)=>L.push([k,a.n,a.w,a.n-a.w,a.wr.toFixed(1)+'%',f(a.net),f(a.gross),f(a.comm)].join(';')));
+ group(r=>r.exit_reason||'—','=== ПО ПРИЧИНАМ ВЫХОДА ===','Причина;Сделок;Побед;Поражений;Winrate;Net PnL;Gross PnL;Комиссии;Ср.длит(сек)',
+  (k,a)=>L.push([k,a.n,a.w,a.n-a.w,a.wr.toFixed(1)+'%',f(a.net),f(a.gross),f(a.comm),a.dur.toFixed(1)].join(';')));
+ group(r=>r.side||'—','=== ПО СТОРОНАМ ===','Сторона;Сделок;Побед;Поражений;Winrate;Net PnL;Gross PnL;Комиссии',
+  (k,a)=>L.push([k,a.n,a.w,a.n-a.w,a.wr.toFixed(1)+'%',f(a.net),f(a.gross),f(a.comm)].join(';')));
+ group(r=>pad(new Date(r.timestamp*1000).getHours()),'=== ПО ЧАСАМ ===','Час;Сделок;Побед;Winrate;Net PnL',
+  (k,a)=>L.push([k,a.n,a.w,a.wr.toFixed(1)+'%',f(a.net)].join(';')));
+ group(r=>{const d=new Date(r.timestamp*1000);return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())},'=== ПО ДНЯМ ===','Дата;Сделок;Побед;Winrate;Net PnL;Gross PnL;Комиссии',
+  (k,a)=>L.push([k,a.n,a.w,a.wr.toFixed(1)+'%',f(a.net),f(a.gross),f(a.comm)].join(';')));
+ downloadCSV('stats_export.csv',L.join('\n'))}
+connectWebSocket();
+</script>
+</body>
+</html>
