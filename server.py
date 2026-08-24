@@ -47,7 +47,13 @@ CONFIG={
 config_api.init_config_api(CONFIG)
 
 def get_param(symbol,key):
-    return CONFIG.get("pair_overrides",{}).get(symbol,{}).get(key, CONFIG.get(key))
+    """Получение параметра с приоритетом: override пары -> глобальный CONFIG -> None"""
+    overrides = CONFIG.get("pair_overrides") or {}
+    pair_override = overrides.get(symbol) or {}
+    # Сначала ищем в override пары, потом в глобальном CONFIG
+    if key in pair_override:
+        return pair_override[key]
+    return CONFIG.get(key)
 def price_decimals(p):
     p=abs(p)
     if p>=1000:return 2
@@ -769,7 +775,7 @@ async def analysis_loop():
                     sinfo=await get_symbol_info(symbol)
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
-                    hour_ok=datetime.utcnow().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
+                    hour_ok=datetime.now().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
                     gate=(state.is_trading and not is_stale and entry_allowed(symbol) and hour_ok
                         and spread_pct<=CONFIG["max_spread_pct"]
                         and len(state.open_positions)<CONFIG["max_open_positions"]

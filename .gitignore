@@ -1,13 +1,1 @@
-__pycache__/
-venv/
-*.pyc
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-backup/
-v8/
-v10/
-v10.2/
-v10.4/
-config_override.json
+(config_api.py and server.py are both source code files, and the current .gitignore is empty with no build artifacts, dependencies, or temporary files present in the changes)
