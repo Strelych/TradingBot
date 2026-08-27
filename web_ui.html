@@ -42,13 +42,30 @@
 .stat-positive{color:var(--green)}.stat-negative{color:var(--red)}
 .section{background:var(--card);padding:20px;border-radius:12px;margin-bottom:20px;border:1px solid var(--line);box-shadow:0 2px 4px rgba(0,0,0,0.1)}
 .section-title{font-size:16px;font-weight:700;color:var(--blue);margin-bottom:15px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;letter-spacing:-0.3px}
-.market-grid,.positions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:15px}
+.market-grid,.positions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:15px}
 .market-card,.position-card,.pending-card{background:var(--card2);padding:16px;border-radius:10px;border:1px solid var(--line);transition:all 0.2s}
 .market-card:hover,.position-card:hover,.pending-card:hover{transform:translateY(-2px);box-shadow:0 8px 16px rgba(0,0,0,0.2)}
 .market-card.trend-up{border-left:4px solid var(--green);background:linear-gradient(90deg,rgba(16,185,129,0.05),var(--card2))}
 .market-card.trend-down{border-left:4px solid var(--red);background:linear-gradient(90deg,rgba(239,68,68,0.05),var(--card2))}
 .position-card.buy{border-left:4px solid var(--green)}.position-card.sell{border-left:4px solid var(--red)}
 .pending-card{border-left:4px solid var(--orange);background:linear-gradient(90deg,rgba(245,158,11,0.05),var(--card2))}
+.market-card.blocked{border-left:4px solid var(--red);opacity:0.85;background:linear-gradient(90deg,rgba(239,68,68,0.08),var(--card2))}
+.market-card.ready{border-left:4px solid var(--green);background:linear-gradient(90deg,rgba(16,185,129,0.08),var(--card2))}
+.market-card.waiting{border-left:4px solid var(--orange)}
+.entry-status{margin-top:12px;padding:12px;background:rgba(15,23,42,0.5);border-radius:8px;border:1px solid var(--line)}
+.entry-status-title{font-size:11px;color:var(--gray);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;font-weight:600;display:flex;align-items:center;gap:6px}
+.status-indicator{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;font-size:10px;margin-right:6px}
+.status-ok{background:rgba(16,185,129,0.2);color:var(--green)}.status-warn{background:rgba(245,158,11,0.2);color:var(--orange)}.status-err{background:rgba(239,68,68,0.2);color:var(--red)}
+.check-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(71,85,105,0.3);font-size:12px}
+.check-item:last-child{border-bottom:none}
+.check-icon{width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:4px;font-size:10px;font-weight:700}
+.check-pass{background:rgba(16,185,129,0.15);color:var(--green)}.check-fail{background:rgba(239,68,68,0.15);color:var(--red)}.check-warn{background:rgba(245,158,11,0.15);color:var(--orange)}
+.check-label{flex:1;color:#e2e8f0}.check-reason{font-size:10px;color:var(--red);margin-left:8px;font-style:italic}
+.readiness-ring{display:inline-block;width:32px;height:32px;border-radius:50%;border:3px solid var(--line);position:relative;margin-right:10px}
+.readiness-ring::before{content:'';position:absolute;top:-3px;left:-3px;right:-3px;bottom:-3px;border-radius:50%;border:3px solid transparent;border-top-color:var(--green);animation:spin 1s linear infinite}
+.readiness-ring.ready{border-color:var(--green)}.readiness-ring.ready::before{display:none}
+.readiness-ring.blocked{border-color:var(--red)}.readiness-ring.blocked::before{display:none}
+@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
 .market-header,.position-header,.pending-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:10px;flex-wrap:wrap}
 .symbol{font-size:16px;font-weight:700;color:#f8fafc;letter-spacing:-0.3px}
 .signal{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;text-transform:uppercase}
@@ -242,10 +259,18 @@ function createMarket(sym){const c=document.createElement('div');c.className='ma
  '<div class="strat-line"><select class="strat-select m-strat" onchange="setStrategy(\''+sym+'\',this.value)">'+
  ['AUTO','WALL','TREND','SWING','GRID','BREAKOUT','OFF'].map(s=>'<option value="'+s+'">'+s+'</option>').join('')+
  '</select><span class="strat-badge m-active">—</span><span class="m-rec" style="font-size:10px;color:#8b949e"></span></div>'+
- '<div class="status-line m-status"></div><div class="checks m-checks"></div>';return c}
+ '<div class="status-line m-status"></div><div class="checks m-checks"></div>'+
+ '<div class="entry-status"><div class="entry-status-title"><span class="readiness-ring"></span><span>Статус входа</span></div><div class="check-list"></div></div>';return c}
 function updateMarket(el,it){const i=it.info;
  const tr=i.trend||'UNKNOWN';
- el.className='market-card '+(tr==='BULLISH'?'trend-up':tr==='BEARISH'?'trend-down':'');
+ const canary=i.canary||0;
+ const minQty=i.min_qty||0;
+ const calcQty=i.calc_qty||0;
+ const hasSignal=i.signal==='BUY'||i.signal==='SELL';
+ const isBlocked=canary<=0.001;
+ const isLowQty=calcQty>0&&calcQty<minQty;
+ const isReady=!isBlocked&&!isLowQty&&hasSignal&&calcQty>=minQty;
+ el.className='market-card '+(tr==='BULLISH'?'trend-up':tr==='BEARISH'?'trend-down':'')+(isBlocked?' blocked':isReady?' ready':' waiting');
  const sig=el.querySelector('.signal');sig.className='signal signal-'+(i.signal||'HOLD');sig.textContent=i.signal||'HOLD';
  const pr=el.querySelector('.price');pr.textContent=formatPrice(i.price);
  pr.className='price '+(tr==='BULLISH'?'up':tr==='BEARISH'?'down':'flat');
@@ -263,7 +288,16 @@ function updateMarket(el,it){const i=it.info;
  el.querySelector('.m-active').textContent='актив: '+(i.strat_active||'—');
  el.querySelector('.m-rec').textContent='auto: '+(i.rec_reason||'');
  el.querySelector('.m-status').textContent=i.status||'';
- el.querySelector('.m-checks').innerHTML=(i.checks||[]).map(c=>'<span class="'+(c.ok?'ok':'bad')+'">'+(c.ok?'✓':'✗')+' '+c.l+'</span>').join('')}
+ el.querySelector('.m-checks').innerHTML=(i.checks||[]).map(c=>'<span class="'+(c.ok?'ok':'bad')+'">'+(c.ok?'✓':'✗')+' '+c.l+'</span>').join('');
+ const ring=el.querySelector('.readiness-ring');
+ ring.className='readiness-ring '+(isBlocked?'blocked':isReady?'ready':'');
+ const checkList=el.querySelector('.check-list');
+ const checks=[];
+ checks.push({ok:!isBlocked,label:'Ликвидность',reason:isBlocked?'Низкая ликвидность/Волатильность (canary=0)':''});
+ checks.push({ok:!isLowQty,label:'Мин. сумма',reason:isLowQty?`Малый депозит (${calcQty.toFixed(4)} < ${minQty})`:''});
+ checks.push({ok:hasSignal,label:'Сигнал',reason:!hasSignal?'Ожидание точки входа':''});
+ checkList.innerHTML=checks.map(ch=>'<div class="check-item"><span class="check-icon '+(ch.ok?'check-pass':'check-fail')+'">'+(ch.ok?'✓':'✗')+'</span><span class="check-label">'+ch.label+'</span>'+(ch.reason?'<span class="check-reason">'+ch.reason+'</span>':'')+'</div>').join('');
+}
 function renderPositions(list){$('positions-count').textContent='('+list.length+')';$('positions-empty').style.display=list.length?'none':'block';
  reconcile($('positions-list'),list,p=>p.key,p=>createPosition(p),updatePosition)}
 function createPosition(p){const c=document.createElement('div');c.className='position-card '+(p.side==='Buy'?'buy':'sell');

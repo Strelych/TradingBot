@@ -919,12 +919,21 @@ async def analysis_loop():
                         if reason:
                             finalize_close(key,pos,px,reason,is_maker=False)
                     walls_out=[{"side":w["side"],"price":round_price(w["price"]),"volume":round(w["volume"],1),"age":int(w["age"])} for w in valid[:2]]
+                    # Расчет потенциального размера позиции для UI
+                    calc_qty=0
+                    if active not in("OFF",) and mid>0:
+                        sl_dist=mid*0.01  # примерный SL для оценки
+                        rm=eff_risk_mult(symbol,active)
+                        raw_qty=compute_size(symbol,mid,sl_dist,rm)
+                        calc_qty=round_qty(raw_qty,sinfo) if sinfo else 0
+                    
                     payload["data"][symbol]={"price":round_price(mid),"imbalance":round(imbalance,3),"signal":signal,
                         "trend":trend1,"is_trading":state.is_trading,"last_price":round_price(state.last_prices.get(symbol,mid)),
                         "spread_pct":round(spread_pct,5),"atr_pct":round(atr_pct,5),"valid_walls":len(valid),"walls":walls_out,
                         "cooldown":int(max(0,state.cooldown_until.get(symbol,0)-now)),"breakout":bo,
                         "strat_set":setv,"strat_active":active,"rec_reason":state.rec_reason.get(symbol,reason),"regime":reg,
-                        "status":status_text,"checks":checks}
+                        "status":status_text,"checks":checks,"canary":adapter.adapter.canary.get(symbol,0),
+                        "min_qty":sinfo.get("min_qty",0),"calc_qty":calc_qty}
                     db_records.append((time.time(),symbol,mid,imbalance,signal,trend1))
                 except Exception as e:
                     state.loop_errors+=1
