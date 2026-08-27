@@ -588,7 +588,7 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         r=tp_to_round(tp,need_side)
         if (need_side=="Buy" and r>entry) or (need_side=="Sell" and r<entry):tp=r
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"WALL")),sinfo)
-    if qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):return out
     order=paper_engine.place_limit_order(symbol,need_side,qty,entry)
     if not order:return out
     state.daily_commission+=order["commission"]
@@ -617,7 +617,7 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"TREND")),sinfo)
-    if qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
     if not order:return out
     state.daily_commission+=order["commission"]
@@ -642,7 +642,7 @@ async def entry_swing(symbol,mid,sinfo):
     if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return out
     entry=round_tick(entry,sinfo);sl_dist=abs(entry-sl)
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"SWING")*get_param(symbol,"swing_risk_mult")),sinfo)
-    if qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
     if not order:return out
     state.daily_commission+=order["commission"]
@@ -666,7 +666,7 @@ async def entry_grid(symbol,mid,sinfo):
         sl=mid*(1-(levels+2)*step)
         sl_dist=abs(price-sl)
         qty=round_qty(compute_size(symbol,price,sl_dist,eff_risk_mult(symbol,"GRID"))/levels,sinfo)
-        if qty<sinfo.get("min_qty",0):continue
+        if not qty or qty<sinfo.get("min_qty",0):continue
         order=paper_engine.place_limit_order(symbol,"Buy",qty,price)
         if not order:
             logger.warning(f"⚠️ GRID {symbol}: не хватает средств на уровень {i}")
@@ -690,7 +690,7 @@ async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)*2
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"BREAKOUT")),sinfo)
-    if qty<sinfo.get("min_qty",0):return None
+    if not qty or qty<sinfo.get("min_qty",0):return None
     order=paper_engine.place_market_order(symbol,side,qty,entry)
     if not order:return None
     state.daily_commission+=order["commission"]
