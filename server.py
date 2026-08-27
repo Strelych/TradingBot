@@ -131,7 +131,12 @@ def total_notional():
 def eff_risk_mult(symbol,strat):
     v=get_param(symbol,"risk_mult")
     base=v if v is not None else 1.0
-    return base*(adapter.adapter.canary.get(symbol) or 1.0)
+    canary_val=adapter.adapter.canary.get(symbol)
+    # Если канарейка=None (не оценена или rm>=1.0), используем 1.0
+    # Если канарейка=0.0 (OFF), блокируем торговлю возвращая 0
+    # Если канарейка в диапазоне (0,1), используем её для снижения риска
+    mult=canary_val if canary_val is not None else 1.0
+    return base*mult
 
 def init_db():
     conn=sqlite3.connect("market_data.db",check_same_thread=False);c=conn.cursor()
@@ -284,6 +289,9 @@ class PaperTradingEngine:
 paper_engine=PaperTradingEngine(CONFIG["virtual_balance"])
 
 def compute_size(symbol,entry,sl_distance,rm):
+    # Если rm=0 (канарейка OFF), возвращаем 0 - торговля заблокирована
+    if rm==0:
+        return 0.0
     balance=max(paper_engine.balance,1.0)
     margin=balance*get_param(symbol,"margin_pct")*rm
     notional=min(margin*CONFIG["leverage"],CONFIG["max_notional"])

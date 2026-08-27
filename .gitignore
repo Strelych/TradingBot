@@ -1,1 +1,4 @@
-(config_api.py and server.py are both source code files, and the current .gitignore is empty with no build artifacts, dependencies, or temporary files present in the changes)
+```
+__pycache__/
+*.pyc
+```
