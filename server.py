@@ -290,7 +290,7 @@ paper_engine=PaperTradingEngine(CONFIG["virtual_balance"])
 
 def compute_size(symbol,entry,sl_distance,rm):
     # Если rm=0 (канарейка OFF), возвращаем 0 - торговля заблокирована
-    if rm==0:
+    if rm==0 or entry==0:
         return 0.0
     balance=max(paper_engine.balance,1.0)
     margin=balance*get_param(symbol,"margin_pct")*rm
