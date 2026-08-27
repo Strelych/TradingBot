@@ -1,1 +1,4 @@
-Nothing should be ignored based on the provided file changes, as only a source file (`server.py`) was modified and no build artifacts, dependencies, or temporary files were included in the changes.
+```
+__pycache__/
+*.pyc
+```

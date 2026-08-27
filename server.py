@@ -132,9 +132,9 @@ def eff_risk_mult(symbol,strat):
     v=get_param(symbol,"risk_mult")
     base=v if v is not None else 1.0
     canary_val=adapter.adapter.canary.get(symbol)
-    # Если канарейка=None (не оценена или rm>=1.0), используем 1.0
+    # Если канарейка=None (пара еще не оценена), используем 1.0
     # Если канарейка=0.0 (OFF), блокируем торговлю возвращая 0
-    # Если канарейка в диапазоне (0,1), используем её для снижения риска
+    # Если канарейка в диапазоне (0,1], используем её для снижения риска
     mult=canary_val if canary_val is not None else 1.0
     return base*mult
 

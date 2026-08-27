@@ -70,7 +70,8 @@ class Adapter:
                 ov[param]=new; self.log(symbol,param,old,new,rsn)
             if changes:
                 self.bump(f"adaptive {symbol}"); self.config_api._save()
-        self.canary[symbol]=rm if rm<1.0 else None
+        # Всегда сохраняем актуальное risk_mult для полного отслеживания состояния
+        self.canary[symbol]=rm
         self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":reason,"ts":time.time(),"locked":locked}
         self.save_knowledge(symbol,strat,rm,reason,locked)
         for s,pm in analyzer.perf_by_strategy(rows).items():
