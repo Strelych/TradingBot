@@ -835,11 +835,40 @@ async def analysis_loop():
                     sinfo=await get_symbol_info(symbol)
                     # Оценка ожидаемого размера позиции для readiness (calc_qty)
                     calc_qty=0
+                    skip_size=False
                     if active not in ("OFF",) and mid>0 and sinfo:
                         sl_dist=mid*0.01
                         rm=eff_risk_mult(symbol,active)
                         raw_qty=compute_size(symbol,mid,sl_dist,rm)
                         calc_qty=round_qty(raw_qty,sinfo)
+                        # Если qty меньше min_qty — попытаться временно поднять risk_mult, если пара не locked
+                        min_qty = sinfo.get("min_qty",0)
+                        if calc_qty < min_qty:
+                            ov = CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
+                            if not ov.get("locked", False):
+                                try:
+                                    if calc_qty>0 and rm>0:
+                                        required_ratio = float(min_qty) / float(calc_qty)
+                                        pass_rm = min(1.0, rm * required_ratio * 1.2)
+                                    else:
+                                        pass_rm = min(1.0, (rm or 1.0) * 1.2)
+                                    raw_qty2 = compute_size(symbol, mid, sl_dist, pass_rm)
+                                    calc_qty2 = round_qty(raw_qty2, sinfo)
+                                except Exception:
+                                    calc_qty2 = 0; pass_rm = rm
+                                if calc_qty2 >= min_qty:
+                                    old_rm = ov.get("risk_mult")
+                                    ov["risk_mult"] = pass_rm
+                                    adapter.adapter.log(symbol, "risk_mult", old_rm, pass_rm, f"auto-size bump to pass min_qty ({calc_qty}->{calc_qty2})")
+                                    config_api._save()
+                                    calc_qty = calc_qty2
+                                    rm = pass_rm
+                                else:
+                                    logger.warning(f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty} even after bump to {pass_rm}")
+                                    skip_size=True
+                            else:
+                                logger.warning(f"⚠️ {symbol} skip_size: locked override prevents size bump; qty {calc_qty} < min_qty {min_qty}")
+                                skip_size=True
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
                     hour_ok=datetime.now().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
