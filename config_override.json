@@ -5,5 +5,10 @@
   "canary_ramp_window": 3,
   "trend_price_tolerance_pct": 0.005,
   "mtf_min_confirms": 1,
+  "imbalance_threshold": 0.5,
+  "wall_volume_multiplier": 6,
+  "margin_pct": 0.1,
+  "min_atr_pct_abs": 0.0016,
+  "risk_change_cooldown": 21600,
   "pair_overrides": {}
 }

@@ -122,7 +122,16 @@ class Adapter:
                 # If we're setting risk_mult to zero, include split-halves info in the log per PR2 §4.4
                 if abs(rm) < 1e-9:
                     rm_reason = reason + f" | halves: h1={h1}, h2={h2}"
-                changes.append(("risk_mult",ov.get("risk_mult"),rm,rm_reason))
+                # Rate-limit risk_mult changes to once per cooldown (default 6h) per PR3 §4.5
+                cooldown = float(self.CONFIG.get("risk_change_cooldown", 21600))
+                self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='risk_mult' ORDER BY ts DESC LIMIT 1",(symbol,))
+                last = self.kn_cur.fetchone()
+                now_ts = time.time()
+                if last and (now_ts - float(last[0]) < cooldown):
+                    # Skip applying risk change due to cooldown; record decision for observability
+                    self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,"reason":f"rate-limited risk change ({int(now_ts-last[0])}s<{int(cooldown)}s): {rm_reason}","ts":now_ts,"locked":locked}
+                else:
+                    changes.append(("risk_mult",ov.get("risk_mult"),rm,rm_reason))
             changes+=analyzer.adaptive_rules(m,h1,h2,self.get_param,symbol)
 
             # если есть изменения (включая adapter_strategy при достижении порога) — применяем
