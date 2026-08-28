@@ -71,8 +71,11 @@ class Adapter:
         atr_threshold=max(atr_floor*2,0.0025)
         if m.get("n",0)<min_sample and atr_pct>=atr_threshold and strat=="WALL":
             strat="TREND"
-            rm=0.5
-            reason=f"холодный старт: высокий ATR {atr_pct:.5f} -> TREND"
+            # по умолчанию даём умеренный risk, но уменьшенный канарейкой при малом числе сделок
+            base_rm = 0.5
+            canary = float(self.CONFIG.get("canary_fraction",0.25))
+            rm = base_rm * (canary if m.get("n",0)<min_sample else 1.0)
+            reason=f"холодный старт: высокий ATR {atr_pct:.5f} -> TREND (canary x{canary})"
 
         # --- Не пиннить WALL в FLAT без стен: fallback в OFF (ожидание)
         if strat=="WALL" and reg.get("wall_share",0)<0.2:
@@ -81,9 +84,10 @@ class Adapter:
             reason=f"FLAT без стен (wall_share={reg.get('wall_share',0):.2f}) -> OFF"
 
         changes=[]
-        # --- Гистерезис смен стратегии: применяем изменение только после 3 подряд рекомендаций
+        # --- Гистерезис смен стратегии: применяем изменение только после N подряд рекомендаций (из CONFIG)
         if not locked:
             cur_as=ov.get("adapter_strategy")
+            hyst_count = int(self.CONFIG.get("adapter_hysteresis_count",3))
             # обработка смены adapter_strategy с гистерезисом
             if cur_as!=strat:
                 st=self._streaks.get(symbol, {"cand":None,"count":0})
@@ -93,13 +97,13 @@ class Adapter:
                     st={"cand":strat,"count":1}
                 self._streaks[symbol]=st
                 # если достигли порога — применяем изменение
-                if st["count"]>=3:
+                if st["count"]>=hyst_count:
                     changes.append(("adapter_strategy",cur_as,strat,reason))
                     # сбросим стрик после применения
                     self._streaks[symbol]={"cand":None,"count":0}
                 else:
                     # не меняем пока не накопим стрик — обновим last_decision для наблюдаемости
-                    self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/3: {reason}","ts":time.time(),"locked":locked}
+                    self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/{hyst_count}: {reason}","ts":time.time(),"locked":locked}
             else:
                 # совпадение с текущей стратегией — сброс стрика
                 self._streaks[symbol]={"cand":None,"count":0}
@@ -115,6 +119,25 @@ class Adapter:
                     ov[param]=new; self.log(symbol,param,old,new,rsn)
                 self.bump(f"adaptive {symbol}"); self.config_api._save()
 
+        # Сохраним целевой (базовый) rm до применения canary — он нам понадобится для возможного рапма
+        target_rm = rm
+        # Если мало данных по паре — дополнительно уменьшить риск по canary_fraction
+        canary = float(self.CONFIG.get("canary_fraction",0.25))
+        if m.get("n",0) < self.CONFIG.get("min_sample",20):
+            if canary>0 and canary<1:
+                rm = rm * canary
+                reason = (self.last_decision.get(symbol,{}).get("reason",reason) + f" | canary x{canary}")
+                # Простая логика рапма: если в последних K сделках >= W прибыльных — восстановить риск до target_rm
+                ramp_wins = int(self.CONFIG.get("canary_ramp_wins",2))
+                ramp_window = int(self.CONFIG.get("canary_ramp_window",3))
+                recent = rows[-ramp_window:] if rows else []
+                wins = sum(1 for r in recent if r[0]>0)
+                if wins>=ramp_wins:
+                    old_rm = rm
+                    rm = target_rm
+                    reason = reason + f" | canary ramp {wins}/{ramp_window} -> rm restored"
+                    # сохраняем в adaptive_log для аудита
+                    self.log(symbol,"risk_mult",old_rm,rm,f"canary ramp after {wins}/{ramp_window} wins")
         # Всегда сохраняем актуальное risk_mult/decision для полного отслеживания состояния
         self.canary[symbol]=rm
         # Если last_decision ещё не установлен выше in hysteresis branch, установим его

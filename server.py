@@ -37,7 +37,9 @@ CONFIG={
  "breakout_cooldown_seconds":7200,"breakout_time_stop":21600,
  "min_atr_pct_abs":0.0016,"trading_hours_blacklist":[],
  "max_spread_pct":0.0006,"atr_period":14,
+ "trend_price_tolerance_pct":0.005,
  "require_trend_alignment":True,"mtf_timeframes":["5","15"],"mtf_min_confirms":2,
+ "adapter_hysteresis_count":3,"canary_fraction":0.25,
  "loss_cooldown_seconds":60,"min_atr_rel":0.4,"max_atr_rel":4.0,
  "adaptive_enabled":True,"min_sample":20,"hysteresis":21600,
  "commission_maker":0.00036,"commission_taker":0.001,
@@ -626,10 +628,12 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     closes=sr.get("closes",[])
     mid=(best_bid+best_ask)/2
     if closes:
-        if side=="Buy" and mid<max(closes[-20:])*0.999:
+        tol = get_param(symbol,"trend_price_tolerance_pct") or 0.005
+        # Allow some leeway from recent highs/lows using configurable tolerance
+        if side=="Buy" and mid<max(closes[-20:])*(1-tol):
             logger.warning(f"⚠️ {symbol} entry_trend skipped: price below recent highs")
             return out
-        if side=="Sell" and mid>min(closes[-20:])*1.001:
+        if side=="Sell" and mid>min(closes[-20:])*(1+tol):
             logger.warning(f"⚠️ {symbol} entry_trend skipped: price above recent lows")
             return out
     entry=round_tick(best_ask if side=="Buy" else best_bid,sinfo)
