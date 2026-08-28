@@ -1,4 +1,4 @@
-# analyzer.py - аналитический движок (v11)
+# analyzer.py - аналитический движок (v12)
 import time, statistics
 from datetime import datetime
 

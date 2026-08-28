@@ -1,4 +1,4 @@
-# server.py - Bybit Scalper v11.1 (Adaptive Analytics + Readiness + Hot Pairs)
+# server.py - Bybit Scalper v12 (Adaptive Analytics + Readiness + Hot Pairs)
 import asyncio, json, time, sqlite3, os, math, traceback
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -303,7 +303,7 @@ def compute_size(symbol,entry,sl_distance,rm):
     if implied>max_risk and implied>0:qty*=max_risk/implied
     return qty
 
-# ===== HOT ADD/REMOVE PAIRS (v11) =====
+# ===== HOT ADD/REMOVE PAIRS (v12) =====
 async def apply_symbols(new_list):
     wanted=[x.strip() for x in dict.fromkeys(new_list) if isinstance(x,str) and x.strip()]
     keep=[x for x in list(state.orderbooks.keys()) if x not in wanted and
@@ -378,7 +378,7 @@ async def lifespan(app):
     state.analysis_task=asyncio.create_task(analysis_loop())
     adapter.adapter.start(state,CONFIG,get_param,config_api)
     asyncio.create_task(housekeeping());asyncio.create_task(watchdog())
-    logger.info("✅ Bybit Scalper v11.1 запущен")
+    logger.info("✅ Bybit Scalper v12 запущен")
     yield
     shutdown_cleanup()
     state.save_stats();await close_http_session()
@@ -416,7 +416,7 @@ async def watchdog():
             state.analysis_task=asyncio.create_task(analysis_loop())
             state.last_tick=time.time()
 
-app=FastAPI(title="Bybit Scalper v11.1",lifespan=lifespan)
+app=FastAPI(title="Bybit Scalper v12",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
 app.include_router(config_api.router)
 @app.get("/",response_class=HTMLResponse)

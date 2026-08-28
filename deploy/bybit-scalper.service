@@ -1,5 +1,5 @@
 [Unit]
-Description=Bybit Scalper v11
+Description=Bybit Scalper v12
 After=network.target
 [Service]
 WorkingDirectory=/root/bybit_scalper

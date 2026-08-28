@@ -1,4 +1,4 @@
-# config_api.py - runtime-конфиг (v11.1)
+# config_api.py - runtime-конфиг (v12)
 import json
 import os
 import logging

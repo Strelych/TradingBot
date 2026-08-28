@@ -1,4 +1,4 @@
-# adapter.py - независимый адаптивный движок (v11)
+# adapter.py - независимый адаптивный движок (v12)
 import asyncio, json, time, sqlite3
 import analyzer
 
