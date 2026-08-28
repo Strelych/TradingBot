@@ -1,12 +1,18 @@
 # config_api.py - runtime-конфиг (v11.1)
-import json, os
+import json
+import os
+import logging
+import threading
+from copy import deepcopy
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
-_state = {"config": None, "path": "config_override.json"}
+_state = {"config": None, "path": "config_override.json", "lock": threading.Lock()}
 symbols_hook = None
 
-CONFIG_META = {
+CONFIG_META: Dict[str, Dict[str, Any]] = {
     "limit_order_offset_pct": {"group":"WALL","type":"float","min":0.0,"max":0.01,"step":0.0001,"desc":"Смещение лимитного ордера от стены."},
     "order_timeout_seconds": {"group":"WALL","type":"int","min":10,"max":600,"step":10,"desc":"Таймаут отмены лимитного ордера."},
     "breakout_lookback": {"group":"BREAKOUT","type":"int","min":10,"max":100,"step":5,"desc":"Свечей для анализа диапазона."},
@@ -81,56 +87,134 @@ CONFIG_META = {
     "symbols": {"group":"Система","type":"list","desc":"Пары через запятую. Применяются БЕЗ перезапуска."},
 }
 
-def _coerce(meta, value):
-    t = meta.get("type","float")
+def _coerce(meta: Dict[str, Any], value: Any) -> Any:
+    """Преобразует значение к типу, указанному в мета-описании."""
+    t = meta.get("type", "float")
     try:
-        if t=="bool": return bool(value)
-        if t=="int": return int(value)
-        if t=="float": return float(value)
-        if t=="str": return str(value)
-        if t=="list": return value if isinstance(value,list) else [x.strip() for x in str(value).split(",") if x.strip()]
+        if t == "bool":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.lower() in ("true", "1", "yes", "on")
+            return bool(value)
+        if t == "int":
+            return int(float(value))  # Позволяет "10.0" → 10
+        if t == "float":
+            return float(value)
+        if t == "str":
+            return str(value) if value is not None else ""
+        if t == "list":
+            if isinstance(value, list):
+                return value
+            if isinstance(value, str):
+                return [x.strip() for x in value.split(",") if x.strip()]
+            return [value] if value is not None else []
         return value
-    except Exception: return value
+    except (ValueError, TypeError, AttributeError) as e:
+        logger.warning(f"Coerce error for {meta.get('desc', 'unknown')}: {e}")
+        return value
 
-def init_config_api(config, path="config_override.json"):
-    _state["config"]=config; _state["path"]=path
+
+def init_config_api(config: Dict[str, Any], path: str = "config_override.json") -> None:
+    """Инициализирует конфигурацию и загружает overrides из файла."""
+    with _state["lock"]:
+        _state["config"] = config
+        _state["path"] = path
+    
     if os.path.exists(path):
         try:
-            ov=json.load(open(path,encoding="utf-8"))
-            for k,v in ov.items():
-                if k=="pair_overrides": config["pair_overrides"]=v
-                elif k in CONFIG_META: config[k]=_coerce(CONFIG_META[k],v)
-        except Exception as e: print("config load error:",e)
+            with open(path, "r", encoding="utf-8") as f:
+                ov = json.load(f)
+            for k, v in ov.items():
+                if k == "pair_overrides":
+                    config["pair_overrides"] = v
+                elif k in CONFIG_META:
+                    config[k] = _coerce(CONFIG_META[k], v)
+            logger.info(f"Config loaded from {path}: {len(ov)} keys")
+        except json.JSONDecodeError as e:
+            logger.error(f"Config JSON decode error ({path}): {e}")
+        except Exception as e:
+            logger.error(f"Config load error ({path}): {e}")
 
-def _save():
+
+def _save() -> bool:
+    """Сохраняет текущую конфигурацию в файл overrides."""
     try:
-        cfg=_state["config"]
-        data={k:cfg.get(k) for k in CONFIG_META}
-        data["pair_overrides"]=cfg.get("pair_overrides",{})
-        json.dump(data,open(_state["path"],"w",encoding="utf-8"),ensure_ascii=False,indent=2)
-    except Exception as e: print("config save error:",e)
+        cfg = _state["config"]
+        if cfg is None:
+            return False
+        data = {k: cfg.get(k) for k in CONFIG_META}
+        data["pair_overrides"] = cfg.get("pair_overrides", {})
+        with open(_state["path"], "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.debug(f"Config saved to {_state['path']}")
+        return True
+    except Exception as e:
+        logger.error(f"Config save error: {e}")
+        return False
+
 
 @router.get("/api/config")
-def get_config():
-    cfg=_state["config"]
-    if cfg is None: raise HTTPException(500,"not initialized")
-    return {k:dict(v,value=cfg.get(k)) for k,v in CONFIG_META.items()}
+def get_config() -> Dict[str, Any]:
+    """Возвращает все параметры конфигурации с метаданными и текущими значениями."""
+    cfg = _state["config"]
+    if cfg is None:
+        raise HTTPException(status_code=500, detail="Configuration not initialized")
+    
+    result = {}
+    with _state["lock"]:
+        for k, v in CONFIG_META.items():
+            item = dict(v)
+            item["value"] = cfg.get(k)
+            result[k] = item
+    return result
+
 
 @router.post("/api/config")
-async def set_config(payload: dict):
-    cfg=_state["config"]
-    if cfg is None: raise HTTPException(500,"not initialized")
-    rr=[]
-    for k,v in payload.items():
-        m=CONFIG_META.get(k)
-        if not m: raise HTTPException(400,f"unknown {k}")
-        v=_coerce(m,v)
-        if m["type"] in ("int","float"):
-            if m.get("min") is not None and v<m["min"]: raise HTTPException(400,f"{k}: минимум {m['min']}")
-            if m.get("max") is not None and v>m["max"]: raise HTTPException(400,f"{k}: максимум {m['max']}")
-        cfg[k]=v
-        if m.get("restart"): rr.append(k)
-    _save()
+async def set_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Обновляет параметры конфигурации. Возвращает список ключей, требующих перезапуска."""
+    cfg = _state["config"]
+    if cfg is None:
+        raise HTTPException(status_code=500, detail="Configuration not initialized")
+    
+    restart_required: List[str] = []
+    errors: List[str] = []
+    
+    with _state["lock"]:
+        for k, v in payload.items():
+            meta = CONFIG_META.get(k)
+            if not meta:
+                errors.append(f"Unknown parameter: {k}")
+                continue
+            
+            v_coerced = _coerce(meta, v)
+            
+            # Валидация числовых диапазонов
+            if meta["type"] in ("int", "float"):
+                min_val = meta.get("min")
+                max_val = meta.get("max")
+                if min_val is not None and v_coerced < min_val:
+                    errors.append(f"{k}: minimum value is {min_val}, got {v_coerced}")
+                    continue
+                if max_val is not None and v_coerced > max_val:
+                    errors.append(f"{k}: maximum value is {max_val}, got {v_coerced}")
+                    continue
+            
+            cfg[k] = v_coerced
+            if meta.get("restart"):
+                restart_required.append(k)
+        
+        # Сохранение после успешной валидации всех параметров
+        if errors:
+            raise HTTPException(status_code=400, detail="; ".join(errors))
+        
+        _save()
+    
+    # Вызов хука для обновления символов (вне блокировки)
     if "symbols" in payload and symbols_hook:
-        await symbols_hook(cfg["symbols"])
-    return {"ok":True,"restart_required":rr}
+        try:
+            await symbols_hook(cfg["symbols"])
+        except Exception as e:
+            logger.error(f"Symbols hook error: {e}")
+    
+    return {"ok": True, "restart_required": restart_required}

@@ -132,9 +132,9 @@ def eff_risk_mult(symbol,strat):
     v=get_param(symbol,"risk_mult")
     base=v if v is not None else 1.0
     canary_val=adapter.adapter.canary.get(symbol)
-    # Если канарейка=None (не оценена или rm>=1.0), используем 1.0
+    # Если канарейка=None (пара еще не оценена), используем 1.0
     # Если канарейка=0.0 (OFF), блокируем торговлю возвращая 0
-    # Если канарейка в диапазоне (0,1), используем её для снижения риска
+    # Если канарейка в диапазоне (0,1], используем её для снижения риска
     mult=canary_val if canary_val is not None else 1.0
     return base*mult
 
@@ -290,7 +290,7 @@ paper_engine=PaperTradingEngine(CONFIG["virtual_balance"])
 
 def compute_size(symbol,entry,sl_distance,rm):
     # Если rm=0 (канарейка OFF), возвращаем 0 - торговля заблокирована
-    if rm==0:
+    if rm==0 or entry==0:
         return 0.0
     balance=max(paper_engine.balance,1.0)
     margin=balance*get_param(symbol,"margin_pct")*rm
@@ -588,7 +588,7 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         r=tp_to_round(tp,need_side)
         if (need_side=="Buy" and r>entry) or (need_side=="Sell" and r<entry):tp=r
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"WALL")),sinfo)
-    if qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):return out
     order=paper_engine.place_limit_order(symbol,need_side,qty,entry)
     if not order:return out
     state.daily_commission+=order["commission"]
@@ -617,7 +617,7 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"TREND")),sinfo)
-    if qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
     if not order:return out
     state.daily_commission+=order["commission"]
@@ -642,7 +642,7 @@ async def entry_swing(symbol,mid,sinfo):
     if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return out
     entry=round_tick(entry,sinfo);sl_dist=abs(entry-sl)
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"SWING")*get_param(symbol,"swing_risk_mult")),sinfo)
-    if qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
     if not order:return out
     state.daily_commission+=order["commission"]
@@ -666,7 +666,7 @@ async def entry_grid(symbol,mid,sinfo):
         sl=mid*(1-(levels+2)*step)
         sl_dist=abs(price-sl)
         qty=round_qty(compute_size(symbol,price,sl_dist,eff_risk_mult(symbol,"GRID"))/levels,sinfo)
-        if qty<sinfo.get("min_qty",0):continue
+        if not qty or qty<sinfo.get("min_qty",0):continue
         order=paper_engine.place_limit_order(symbol,"Buy",qty,price)
         if not order:
             logger.warning(f"⚠️ GRID {symbol}: не хватает средств на уровень {i}")
@@ -690,7 +690,7 @@ async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)*2
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"BREAKOUT")),sinfo)
-    if qty<sinfo.get("min_qty",0):return None
+    if not qty or qty<sinfo.get("min_qty",0):return None
     order=paper_engine.place_market_order(symbol,side,qty,entry)
     if not order:return None
     state.daily_commission+=order["commission"]
@@ -919,12 +919,21 @@ async def analysis_loop():
                         if reason:
                             finalize_close(key,pos,px,reason,is_maker=False)
                     walls_out=[{"side":w["side"],"price":round_price(w["price"]),"volume":round(w["volume"],1),"age":int(w["age"])} for w in valid[:2]]
+                    # Расчет потенциального размера позиции для UI
+                    calc_qty=0
+                    if active not in("OFF",) and mid>0:
+                        sl_dist=mid*0.01  # примерный SL для оценки
+                        rm=eff_risk_mult(symbol,active)
+                        raw_qty=compute_size(symbol,mid,sl_dist,rm)
+                        calc_qty=round_qty(raw_qty,sinfo) if sinfo else 0
+                    
                     payload["data"][symbol]={"price":round_price(mid),"imbalance":round(imbalance,3),"signal":signal,
                         "trend":trend1,"is_trading":state.is_trading,"last_price":round_price(state.last_prices.get(symbol,mid)),
                         "spread_pct":round(spread_pct,5),"atr_pct":round(atr_pct,5),"valid_walls":len(valid),"walls":walls_out,
                         "cooldown":int(max(0,state.cooldown_until.get(symbol,0)-now)),"breakout":bo,
                         "strat_set":setv,"strat_active":active,"rec_reason":state.rec_reason.get(symbol,reason),"regime":reg,
-                        "status":status_text,"checks":checks}
+                        "status":status_text,"checks":checks,"canary":adapter.adapter.canary.get(symbol,0),
+                        "min_qty":sinfo.get("min_qty",0),"calc_qty":calc_qty}
                     db_records.append((time.time(),symbol,mid,imbalance,signal,trend1))
                 except Exception as e:
                     state.loop_errors+=1
