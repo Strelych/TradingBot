@@ -47,6 +47,14 @@ class Adapter:
         self.kn_cur.execute("INSERT INTO config_versions(ts,version,overrides,note) VALUES(?,?,?,?)",
             (time.time(),self.version,json.dumps(self.CONFIG.get("pair_overrides",{})),note))
     def save_knowledge(self,symbol,strat,rm,reason,locked):
+        # Do not overwrite pair_knowledge for locked pairs — adapter must not change locked settings (PR2 §4.4)
+        if locked:
+            # If there's no existing knowledge row, don't create one either — respect manual lock
+            self.kn_cur.execute("SELECT 1 FROM pair_knowledge WHERE symbol=?",(symbol,))
+            if self.kn_cur.fetchone():
+                return
+            else:
+                return
         self.kn_cur.execute("INSERT OR REPLACE INTO pair_knowledge(symbol,ts,strategy,risk_mult,reason,locked) VALUES(?,?,?,?,?,?)",
             (symbol,time.time(),strat,rm,reason,1 if locked else 0))
     # --- оценка пары ---
@@ -110,7 +118,11 @@ class Adapter:
 
             # risk_mult и adaptive_rules применяются сразу (no hysteresis)
             if abs((ov.get("risk_mult") or 1.0)-rm)>1e-9:
-                changes.append(("risk_mult",ov.get("risk_mult"),rm,reason))
+                rm_reason = reason
+                # If we're setting risk_mult to zero, include split-halves info in the log per PR2 §4.4
+                if abs(rm) < 1e-9:
+                    rm_reason = reason + f" | halves: h1={h1}, h2={h2}"
+                changes.append(("risk_mult",ov.get("risk_mult"),rm,rm_reason))
             changes+=analyzer.adaptive_rules(m,h1,h2,self.get_param,symbol)
 
             # если есть изменения (включая adapter_strategy при достижении порога) — применяем
@@ -157,6 +169,7 @@ class Adapter:
         while True:
             await asyncio.sleep(60)
             try:
+                evaluated=[]
                 for symbol in self.CONFIG["symbols"]:
                     ov=self.CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
                     self.state.db_cursor.execute("SELECT COUNT(*) FROM trades WHERE symbol=?",(symbol,))
@@ -165,6 +178,46 @@ class Adapter:
                     if need_event or (time.time()-self.last_eval.get(symbol,0))>900:
                         self.eval(symbol,ov)
                         self.last_n[symbol]=n;self.last_eval[symbol]=time.time()
+                    # collect a quick view whether pair is effectively skipped/off
+                    # consider skipped if adapter set risk_mult==0 or adapter_strategy=="OFF" or pair_overrides risk_mult==0
+                    ov_effective = ov.get("risk_mult", None)
+                    adapter_as = ov.get("adapter_strategy")
+                    canary_val = self.canary.get(symbol, None)
+                    skipped = (ov_effective == 0) or (adapter_as == "OFF") or (canary_val == 0)
+                    evaluated.append((symbol, skipped, ov.get("locked", False)))
+
+                # After evaluating all symbols — anti-deadlock: if ALL pairs are skipped/off, pick a fee-positive pair
+                # with max atr_pct and set a canary on it (but do NOT touch locked pairs)
+                if evaluated and all(s for (_, s, __) in evaluated):
+                    # find candidate by reading live_regime table
+                    candidates=[]
+                    min_atr = float(self.CONFIG.get("min_atr_pct_abs", 0.0016))
+                    for sym in self.CONFIG.get("symbols",[]):
+                        # do not override locked pairs
+                        ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
+                        if ov.get("locked"): continue
+                        self.kn_cur.execute("SELECT atr_pct FROM live_regime WHERE symbol=?",(sym,))
+                        r=self.kn_cur.fetchone()
+                        atr_pct = (r[0] if r else 0) if r else 0
+                        if atr_pct>=min_atr:
+                            candidates.append((sym,atr_pct))
+                    if candidates:
+                        # pick max atr_pct
+                        best = max(candidates, key=lambda x:x[1])[0]
+                        ov_best = self.CONFIG.setdefault("pair_overrides",{}).setdefault(best,{})
+                        # set a canary risk_mult=0.5 and adapter_strategy per recommend (if not FEE_NEGATIVE)
+                        reg = self.read_regime(best)
+                        reg_dict={"atr_pct":reg[4],"trendiness":reg[1],"vol_rel":reg[0],"wall_share":reg[2],"min_atr_pct_abs":min_atr}
+                        rec, reason = analyzer.recommend(reg_dict)
+                        # Only set if recommended is tradeable (not FEE_NEGATIVE)
+                        if rec != "FEE_NEGATIVE":
+                            # write override but respect locked check above
+                            old_rm = ov_best.get("risk_mult")
+                            ov_best["risk_mult"] = ov_best.get("risk_mult",1.0) * 0.5 if ov_best.get("risk_mult") is not None else 0.5
+                            ov_best["adapter_strategy"] = ov_best.get("adapter_strategy") or rec
+                            self.log(best, "risk_mult", old_rm, ov_best["risk_mult"], f"anti-deadlock canary (picked by atr_pct={reg_dict['atr_pct']})")
+                            self.bump(f"canary {best}")
+                            self.config_api._save()
                 self.kn_conn.commit()
             except Exception as e:
                 print("adapter err:",e)
