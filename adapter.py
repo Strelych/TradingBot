@@ -9,6 +9,8 @@ class Adapter:
         self.state=None;self.CONFIG=None;self.get_param=None;self.config_api=None
         self.kn_conn,self.kn_cur=self._init()
         self.last_n={};self.last_eval={};self.last_decision={};self.canary={};self.version=0
+        # Для гистерезиса смен стратегии: хранит (candidate_strategy, count)
+        self._streaks = {}
     def _init(self):
         conn=sqlite3.connect(KN,check_same_thread=False);c=conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS adaptive_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,
@@ -61,18 +63,68 @@ class Adapter:
         locked=bool(ov.get("locked"))
         current=ov.get("adapter_strategy") or "AUTO"
         strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale)
+
+        # --- Холодный старт: если мало данных, но ATR явно велик, предпочесть TREND вместо WALL
+        min_sample=self.CONFIG.get("min_sample",20)
+        atr_pct=reg.get("atr_pct",0)
+        atr_floor=self.CONFIG.get("min_atr_pct_abs",0.0016)
+        atr_threshold=max(atr_floor*2,0.0025)
+        if m.get("n",0)<min_sample and atr_pct>=atr_threshold and strat=="WALL":
+            strat="TREND"
+            rm=0.5
+            reason=f"холодный старт: высокий ATR {atr_pct:.5f} -> TREND"
+
+        # --- Не пиннить WALL в FLAT без стен: fallback в OFF (ожидание)
+        if strat=="WALL" and reg.get("wall_share",0)<0.2:
+            strat="OFF"
+            rm=0.0
+            reason=f"FLAT без стен (wall_share={reg.get('wall_share',0):.2f}) -> OFF"
+
         changes=[]
+        # --- Гистерезис смен стратегии: применяем изменение только после 3 подряд рекомендаций
         if not locked:
-            if ov.get("adapter_strategy")!=strat: changes.append(("adapter_strategy",ov.get("adapter_strategy"),strat,reason))
-            if abs((ov.get("risk_mult") or 1.0)-rm)>1e-9: changes.append(("risk_mult",ov.get("risk_mult"),rm,reason))
+            cur_as=ov.get("adapter_strategy")
+            # обработка смены adapter_strategy с гистерезисом
+            if cur_as!=strat:
+                st=self._streaks.get(symbol, {"cand":None,"count":0})
+                if st.get("cand")==strat:
+                    st["count"]+=1
+                else:
+                    st={"cand":strat,"count":1}
+                self._streaks[symbol]=st
+                # если достигли порога — применяем изменение
+                if st["count"]>=3:
+                    changes.append(("adapter_strategy",cur_as,strat,reason))
+                    # сбросим стрик после применения
+                    self._streaks[symbol]={"cand":None,"count":0}
+                else:
+                    # не меняем пока не накопим стрик — обновим last_decision для наблюдаемости
+                    self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/3: {reason}","ts":time.time(),"locked":locked}
+            else:
+                # совпадение с текущей стратегией — сброс стрика
+                self._streaks[symbol]={"cand":None,"count":0}
+
+            # risk_mult и adaptive_rules применяются сразу (no hysteresis)
+            if abs((ov.get("risk_mult") or 1.0)-rm)>1e-9:
+                changes.append(("risk_mult",ov.get("risk_mult"),rm,reason))
             changes+=analyzer.adaptive_rules(m,h1,h2,self.get_param,symbol)
-            for param,old,new,rsn in changes:
-                ov[param]=new; self.log(symbol,param,old,new,rsn)
+
+            # если есть изменения (включая adapter_strategy при достижении порога) — применяем
             if changes:
+                for param,old,new,rsn in changes:
+                    ov[param]=new; self.log(symbol,param,old,new,rsn)
                 self.bump(f"adaptive {symbol}"); self.config_api._save()
-        # Всегда сохраняем актуальное risk_mult для полного отслеживания состояния
+
+        # Всегда сохраняем актуальное risk_mult/decision для полного отслеживания состояния
         self.canary[symbol]=rm
-        self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":reason,"ts":time.time(),"locked":locked}
+        # Если last_decision ещё не установлен выше in hysteresis branch, установим его
+        if symbol not in self.last_decision:
+            self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,"reason":reason,"ts":time.time(),"locked":locked}
+        self.last_decision[symbol]["strategy"] = strat
+        self.last_decision[symbol]["risk_mult"] = rm
+        self.last_decision[symbol]["reason"] = self.last_decision[symbol].get("reason",reason)
+        self.last_decision[symbol]["ts"] = time.time()
+
         self.save_knowledge(symbol,strat,rm,reason,locked)
         for s,pm in analyzer.perf_by_strategy(rows).items():
             self.kn_cur.execute("INSERT INTO strategy_performance(ts,symbol,strategy,trades,wr,gross,fees,net,avg_mfe,avg_mae) VALUES(?,?,?,?,?,?,?,?,?,?)",
