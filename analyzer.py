@@ -18,11 +18,40 @@ def regime(state, symbol):
     return {"vol_rel":round(vol_rel,2),"trendiness":round(trendiness(sr.get("closes",[])),3),
             "wall_share":round(wt/tot,2) if tot>0 else 0.0,"atr_pct":round(atr_pct,5)}
 
+# Default fee floor (min_atr_pct_abs). analyzer.recommend uses this to avoid suggesting strategies
+# that aren't fee-positive on low-ATR pairs.
+FEE_FLOOR_DEFAULT = 0.0016
+
 def recommend(reg):
-    if reg["trendiness"]>0.25 and reg["vol_rel"]>1.2: return "TREND","трендовость+волатильность"
-    if reg["wall_share"]>0.5 and 0.7<=reg["vol_rel"]<=1.5 and reg["trendiness"]<=0.25: return "WALL","боковик со стенами"
-    if reg["vol_rel"]<0.7 and reg["trendiness"]<=0.2: return "SWING","низкая волатильность"
-    return "WALL","базовый режим"
+    """Рекомендация режима с учётом fee-экономики (TASK PR1 4.1).
+    Returns (strategy, reason). Possible strategy values: TREND, WALL, SWING, FEE_NEGATIVE.
+    - TREND: atr_pct >= fee_floor and trendiness >= 0.15
+    - WALL: atr_pct >= fee_floor and wall_share >= 0.5 and trendiness < 0.15
+    - SWING: atr_pct >= fee_floor and vol_rel < 0.7
+    - FEE_NEGATIVE: atr_pct < fee_floor (avoid trading; WALL only as canary)
+    FLAT без стен не возвращает WALL по умолчанию.
+    """
+    fee_floor = reg.get("min_atr_pct_abs", FEE_FLOOR_DEFAULT)
+    atr_pct = reg.get("atr_pct", 0.0)
+    trendiness_v = reg.get("trendiness", 0.0)
+    vol_rel = reg.get("vol_rel", 1.0)
+    wall_share = reg.get("wall_share", 0.0)
+
+    # Fee-positive pairs
+    if atr_pct >= fee_floor:
+        if trendiness_v >= 0.15:
+            return "TREND", "волатильна, есть трендовость"
+        if wall_share >= 0.5 and trendiness_v < 0.15:
+            return "WALL", "боковик со стенами"
+        if vol_rel < 0.7:
+            return "SWING", "низкая волатильность"
+        # Otherwise prefer TREND if any mild trend, else SWING as safer default
+        if trendiness_v >= 0.10:
+            return "TREND", "умеренная трендовость"
+        return "SWING", "нейтрально — предпочитаем SWING"
+    else:
+        # Fee-negative: atr below fee floor — avoid TREND; allow WALL only as canary
+        return "FEE_NEGATIVE", "ATR < fee_floor — избегать торгов (может использоваться канарейка WALL)"
 
 def breakout_state(kl, max_range_pct):
     if not kl or len(kl)<30: return {"active":False,"side":None,"range_pct":0,"vol_ratio":0}
@@ -87,20 +116,67 @@ def hour_stats(rows, worst=3):
     lst.sort(key=lambda x:x["net"])
     return lst[:worst]
 
-def decide_strategy(scores, reg, bo, current, stale, min_n=3, off_floor=-0.03):
-    if bo.get("active"): return "BREAKOUT",1.0,"активный пробой диапазона"
-    elig={s:m for s,m in scores.items() if m["n"]>=min_n}
-    prof={s:m for s,m in elig.items() if m["net_per_trade"]>0}
+def decide_strategy(scores, reg, bo, current, stale, m=None, h1=None, h2=None, min_sample=20, min_n=3, off_floor=-0.03):
+    """Decide strategy with cold-start and split-validation (TASK PR1 4.2).
+    - If bo active -> BREAKOUT
+    - If total trades < min_sample -> never OFF and never risk_mult=0; return recommend() with canary 0.5
+    - OFF only when BOTH halves (h1 & h2) have net_per_trade < off_floor
+    - borderline (>= off_floor) -> canary x0.25
+    - profitable -> x0.5 or x1.0 when n>=10
+    """
+    if bo.get("active"):
+        return "BREAKOUT", 1.0, "активный пробой диапазона"
+
+    # total trades across strategies
+    total_n = 0
+    try:
+        total_n = sum(int(v.get("n", 0)) for v in scores.values())
+    except Exception:
+        total_n = 0
+
+    # Cold start: if not enough history, do not return OFF or risk=0
+    if m is None:
+        m_n = total_n
+    else:
+        m_n = int(m.get("n", total_n))
+
+    if m_n < min_sample:
+        rec, reason = recommend(reg)
+        # If fee-negative, still return what recommend suggests, but canary should be conservative
+        rm = 0.5
+        return rec, rm, f"мало данных (n={m_n} < {min_sample}): режимная канарейка ×0.5 | {reason}"
+
+    # Split-validation for OFF
+    both_bad = False
+    if h1 is not None and h2 is not None:
+        try:
+            both_bad = (h1.get("net_per_trade", 0) < off_floor) and (h2.get("net_per_trade", 0) < off_floor)
+        except Exception:
+            both_bad = False
+
+    elig = {s: m for s, m in scores.items() if m.get("n", 0) >= min_n}
+    prof = {s: m for s, m in elig.items() if m.get("net_per_trade", 0) > 0}
+
     if prof:
-        s,b=max(prof.items(),key=lambda kv:kv[1]["net_per_trade"])
-        return s,(1.0 if b["n"]>=10 else 0.5),f"лучший net/сделку {b['net_per_trade']:+.3f} (n={b['n']})"
+        s, b = max(prof.items(), key=lambda kv: kv[1]["net_per_trade"])
+        return s, (1.0 if b.get("n", 0) >= 10 else 0.5), f"лучший net/сделку {b['net_per_trade']:+.3f} (n={b['n']})"
+
     if elig:
-        s,b=max(elig.items(),key=lambda kv:kv[1]["net_per_trade"])
-        if b["net_per_trade"]>=off_floor:
-            return s,0.25,f"пограничный net/сделку {b['net_per_trade']:+.3f} — канарейка ×0.25"
-        if current=="OFF" and stale: return recommend(reg)[0],0.25,"ре-разведка после OFF"
-        return "OFF",0.0,f"все стратегии убыточны (лучший {b['net_per_trade']:+.3f})"
-    return recommend(reg)[0],0.5,"мало данных: режимная канарейка ×0.5"
+        s, b = max(elig.items(), key=lambda kv: kv[1]["net_per_trade"])
+        if b.get("net_per_trade", 0) >= off_floor:
+            return s, 0.25, f"пограничный net/сделку {b['net_per_trade']:+.3f} — канарейка ×0.25"
+        # If both halves are bad -> OFF with honest 0 risk
+        if both_bad:
+            return "OFF", 0.0, f"split-валидация: обе половины хуже {off_floor:+.3f} -> OFF"
+        # If current is OFF and stale, try re-reconnaissance
+        if current == "OFF" and stale:
+            rec, reason = recommend(reg)
+            return rec, 0.25, f"ре-разведка после OFF: {reason}"
+        return "OFF", 0.0, f"все стратегии убыточны (лучший {b['net_per_trade']:+.3f})"
+
+    # No eligible strategies -> fall back to recommend (fee-aware)
+    rec, reason = recommend(reg)
+    return rec, 0.5, f"мало данных / нет eligible: режимная канарейка ×0.5 | {reason}"
 
 def adaptive_rules(m, h1, h2, get, symbol):
     out=[]

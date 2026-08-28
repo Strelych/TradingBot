@@ -62,7 +62,7 @@ class Adapter:
         stale=(time.time()-last_trade)>2*3600
         locked=bool(ov.get("locked"))
         current=ov.get("adapter_strategy") or "AUTO"
-        strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale)
+        strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale,m,h1,h2,min_sample=self.CONFIG.get("min_sample",20))
 
         # --- Холодный старт: если мало данных, но ATR явно велик, предпочесть TREND вместо WALL
         min_sample=self.CONFIG.get("min_sample",20)
