@@ -104,11 +104,23 @@ class Adapter:
                 else:
                     st={"cand":strat,"count":1}
                 self._streaks[symbol]=st
-                # если достигли порога — применяем изменение
+                # если достигли порога — применяем изменение (но учитываем cooldown по времени)
                 if st["count"]>=hyst_count:
-                    changes.append(("adapter_strategy",cur_as,strat,reason))
-                    # сбросим стрик после применения
-                    self._streaks[symbol]={"cand":None,"count":0}
+                    # Enforce time-based cooldown for strategy change (CONFIG['hysteresis'] seconds)
+                    cooldown = int(self.CONFIG.get("hysteresis", 21600))
+                    self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='adapter_strategy' ORDER BY ts DESC LIMIT 1", (symbol,))
+                    last_row = self.kn_cur.fetchone()
+                    last_ts = float(last_row[0]) if last_row else 0
+                    now_ts = time.time()
+                    if last_row and (now_ts - last_ts) < cooldown:
+                        # rate-limited — do not apply, record for observability
+                        self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,
+                                                     "reason":f"rate-limited strategy change ({int(now_ts-last_ts)}s<{cooldown}s): {reason}",
+                                                     "ts":now_ts,"locked":locked}
+                    else:
+                        changes.append(("adapter_strategy",cur_as,strat,reason))
+                        # сбросим стрик после применения
+                        self._streaks[symbol]={"cand":None,"count":0}
                 else:
                     # не меняем пока не накопим стрик — обновим last_decision для наблюдаемости
                     self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/{hyst_count}: {reason}","ts":time.time(),"locked":locked}
