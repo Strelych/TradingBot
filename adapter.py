@@ -58,7 +58,7 @@ class Adapter:
         self.kn_cur.execute("INSERT OR REPLACE INTO pair_knowledge(symbol,ts,strategy,risk_mult,reason,locked) VALUES(?,?,?,?,?,?)",
             (symbol,time.time(),strat,rm,reason,1 if locked else 0))
     # --- оценка пары ---
-    def eval(self,symbol,ov):
+    async def eval(self,symbol,ov):
         rows=analyzer.get_rows(self.state.db_conn,symbol,72)
         m=analyzer.trade_metrics(rows)
         h1,h2=analyzer.halves(rows)
@@ -140,6 +140,70 @@ class Adapter:
                     ov[param]=new; self.log(symbol,param,old,new,rsn)
                 self.bump(f"adaptive {symbol}"); self.config_api._save()
 
+        # --- Adaptive allowed_side по 1h EMA-slope (>=3 подряд) ---
+        try:
+            if self.CONFIG.get("adaptive_enabled", True) and not self.CONFIG.get("locked_strict", False) and not locked:
+                # Собираем последние рыночные снимки за последние 6 часов
+                since = time.time() - 6*3600
+                cur = self.state.db_conn.cursor()
+                cur.execute("SELECT timestamp,price FROM market_snapshots WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC", (symbol, since))
+                rows_ms = cur.fetchall()
+                if rows_ms:
+                    # Группируем по hourly bucket и собираем цены внутри часа
+                    hours = {}
+                    for ts, price in rows_ms:
+                        h = int(ts)//3600
+                        hours.setdefault(h, []).append(float(price))
+                    hour_keys = sorted(hours.keys())
+                    def ema_trend_local(closes, period=int(self.CONFIG.get("ema_period",20)), band=float(self.CONFIG.get("trend_price_tolerance_pct",0.001))):
+                        if not closes: return "FLAT"
+                        e = closes[0]
+                        for c in closes[1:]:
+                            e = (c - e) * (2.0/(period+1)) + e
+                        if closes[-1] > e*(1+band): return "BULLISH"
+                        if closes[-1] < e*(1-band): return "BEARISH"
+                        return "FLAT"
+                    hour_trends = []
+                    for hk in hour_keys:
+                        cls = hours[hk]
+                        # Нужны хотя бы несколько тиков внутри часа
+                        if len(cls) >= 3:
+                            hour_trends.append(ema_trend_local(cls))
+                    # Если есть 3 подряд одинаковых тренда — задаём allowed_side
+                    desired_side = None
+                    if len(hour_trends) >= 3:
+                        last3 = hour_trends[-3:]
+                        if all(t=="BULLISH" for t in last3): desired_side = "Buy"
+                        elif all(t=="BEARISH" for t in last3): desired_side = "Sell"
+                    # Применяем cooldown 6ч (настройка hysteresis в CONFIG использована как cooldown)
+                    cooldown = int(self.CONFIG.get("hysteresis", 21600))
+                    self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='allowed_side' ORDER BY ts DESC LIMIT 1", (symbol,))
+                    last_row = self.kn_cur.fetchone()
+                    last_ts = float(last_row[0]) if last_row else 0
+                    # Получим текущее override
+                    cur_allowed = ov.get("allowed_side")
+                    if desired_side:
+                        if cur_allowed != desired_side and (time.time() - last_ts) >= cooldown:
+                            old = cur_allowed
+                            ov["allowed_side"] = desired_side
+                            self.log(symbol, "allowed_side", old, desired_side, f"adaptive 1h EMA x3 -> {desired_side}")
+                            self.bump(f"allowed_side {symbol}")
+                            self.config_api._save()
+                    else:
+                        # Авто-сброс в BOTH при развороте (один цикл)
+                        if cur_allowed in ("Buy","Sell") and hour_trends:
+                            last_hour = hour_trends[-1]
+                            mapped = "BULLISH" if cur_allowed=="Buy" else "BEARISH"
+                            if last_hour and last_hour != mapped:
+                                old = cur_allowed
+                                ov["allowed_side"] = "BOTH"
+                                self.log(symbol, "allowed_side", old, "BOTH", f"1h trend reversal ({last_hour}) -> BOTH (one cycle)")
+                                self.bump(f"allowed_side_rev {symbol}")
+                                self.config_api._save()
+        except Exception:
+            # Не ломаем адаптер из-за логики allowed_side
+            pass
+
         # Сохраним целевой (базовый) rm до применения canary — он нам понадобится для возможного рапма
         target_rm = rm
         # Если мало данных по паре — дополнительно уменьшить риск по canary_fraction
@@ -185,7 +249,7 @@ class Adapter:
                     n=self.state.db_cursor.fetchone()[0]
                     need_event=(n-self.last_n.get(symbol,n))>=10
                     if need_event or (time.time()-self.last_eval.get(symbol,0))>900:
-                        self.eval(symbol,ov)
+                        await self.eval(symbol,ov)
                         self.last_n[symbol]=n;self.last_eval[symbol]=time.time()
                     # collect a quick view whether pair is effectively skipped/off
                     # consider skipped if adapter set risk_mult==0 or adapter_strategy=="OFF" or pair_overrides risk_mult==0

@@ -18,6 +18,7 @@ CONFIG={
  "virtual_balance":500.0,"leverage":10,
  "symbols":["BTCUSDT","ETHUSDT","SOLUSDT","HUSDT","GRAMUSDT"],
  "pair_overrides":{},
+ "allowed_side":"BOTH","locked_strict":False,
  "margin_pct":0.1,"max_risk_pct":0.01,"max_notional":1000.0,"max_total_notional":1500.0,
  "max_open_positions":3,"max_pending_orders":12,
  "max_daily_trades":0,"max_daily_commission":0.0,"daily_loss_halt_pct":0.0,
@@ -49,13 +50,25 @@ CONFIG={
 config_api.init_config_api(CONFIG)
 
 def get_param(symbol,key):
-    """Получение параметра с приоритетом: override пары -> глобальный CONFIG -> None"""
+    """Получение параметра с приоритетом: override пары -> глобальный CONFIG -> sensible default
+    Defaults are intentionally loose (allowed_side=BOTH, locked=False, risk_mult=1.0)
+    """
     overrides = CONFIG.get("pair_overrides") or {}
     pair_override = overrides.get(symbol) or {}
     # Сначала ищем в override пары, потом в глобальном CONFIG
     if key in pair_override:
         return pair_override[key]
-    return CONFIG.get(key)
+    # fall back to global CONFIG
+    if key in CONFIG:
+        return CONFIG.get(key)
+    # final sensible defaults
+    if key=="allowed_side":
+        return "BOTH"
+    if key=="locked":
+        return False
+    if key=="risk_mult":
+        return 1.0
+    return None
 def price_decimals(p):
     p=abs(p)
     if p>=1000:return 2
@@ -63,6 +76,21 @@ def price_decimals(p):
     if p>=1:return 4
     if p>=0.01:return 6
     return 8
+
+# --- Throttled logging for warnings (PR1 2.5)
+_last_log = {}
+
+def log_warn_throttle(symbol, reason_key, msg, interval=60):
+    """Log warning at most once per (symbol, reason_key) per interval seconds."""
+    now=time.time()
+    k=(symbol,reason_key)
+    last=_last_log.get(k,0)
+    if now-last>=interval:
+        logger.warning(msg)
+        _last_log[k]=now
+    else:
+        # optionally, keep a debug for suppressed logs
+        logger.debug(f"throttled warning {symbol} {reason_key} (suppressed)")
 def round_price(p):return round(p,price_decimals(p))
 def round_grid(p):
     if p>=1000:return 100
@@ -570,24 +598,24 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         if state.imbalance_counters[symbol]<=-get_param(symbol,"imbalance_confirmation_ticks"):need_side="Sell"
     else:state.imbalance_counters[symbol]=0
     if not need_side:
-        logger.warning(f"⚠️ {symbol} entry_wall skipped: no imbalance/need_side")
+        log_warn_throttle(symbol, "no_imbalance", f"⚠️ {symbol} entry_wall skipped: no imbalance/need_side")
         return out
     if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=need_side:
-        logger.warning(f"⚠️ {symbol} entry_wall skipped: side not allowed (need {need_side})")
+        log_warn_throttle(symbol, "side_not_allowed", f"⚠️ {symbol} entry_wall skipped: side not allowed (need {need_side})")
         return out
     if CONFIG["require_trend_alignment"]:
         need="BULLISH" if need_side=="Buy" else "BEARISH"
         if trend1!=need or sum(1 for tf in mtf.values() if tf==need)<get_param(symbol,"mtf_min_confirms"):
-            logger.warning(f"⚠️ {symbol} entry_wall skipped: trend not aligned (need {need})")
+            log_warn_throttle(symbol, "trend_not_aligned", f"⚠️ {symbol} entry_wall skipped: trend not aligned (need {need})")
             return out
     walls=[w for w in wall_tracker.valid(symbol) if w["side"]==("bid" if need_side=="Buy" else "ask")]
     if not walls:
-        logger.warning(f"⚠️ {symbol} entry_wall skipped: no walls")
+        log_warn_throttle(symbol, "no_walls", f"⚠️ {symbol} entry_wall skipped: no walls")
         return out
     wall=min(walls,key=lambda w:abs(w["price"]-mid))
     fp=best_ask if need_side=="Buy" else best_bid
     if abs(fp-mid)/mid>0.001:
-        logger.warning(f"⚠️ {symbol} entry_wall skipped: price far from mid (fp={fp} mid={mid})")
+        log_warn_throttle(symbol, "price_far_from_mid", f"⚠️ {symbol} entry_wall skipped: price far from mid (fp={fp} mid={mid})")
         return out
     entry=round_tick(wall["price"]*(1+CONFIG["limit_order_offset_pct"]) if need_side=="Buy" else wall["price"]*(1-CONFIG["limit_order_offset_pct"]),sinfo)
     wall_sl=wall["price"]*(1-get_param(symbol,"sl_behind_wall_pct")) if need_side=="Buy" else wall["price"]*(1+get_param(symbol,"sl_behind_wall_pct"))
@@ -601,11 +629,11 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         if (need_side=="Buy" and r>entry) or (need_side=="Sell" and r<entry):tp=r
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"WALL")),sinfo)
     if not qty or qty<sinfo.get("min_qty",0):
-        logger.warning(f"⚠️ {symbol} entry_wall skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        log_warn_throttle(symbol, "qty_below_min", f"⚠️ {symbol} entry_wall skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
         return out
     order=paper_engine.place_limit_order(symbol,need_side,qty,entry)
     if not order:
-        logger.warning(f"⚠️ {symbol} entry_wall skipped: order placement failed")
+        log_warn_throttle(symbol, "order_failed", f"⚠️ {symbol} entry_wall skipped: order placement failed")
         return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,need_side,entry,qty,
@@ -620,10 +648,10 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     if trend1=="BULLISH" and sum(1 for v in mtf.values() if v=="BULLISH")>=get_param(symbol,"mtf_min_confirms") and imbalance>-0.2:side="Buy"
     elif trend1=="BEARISH" and sum(1 for v in mtf.values() if v=="BEARISH")>=get_param(symbol,"mtf_min_confirms") and imbalance<0.2:side="Sell"
     if not side:
-        logger.warning(f"⚠️ {symbol} entry_trend skipped: no side (trend/mtf/imbalance)")
+        log_warn_throttle(symbol, "no_side_trend", f"⚠️ {symbol} entry_trend skipped: no side (trend/mtf/imbalance)")
         return out
     if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
-        logger.warning(f"⚠️ {symbol} entry_trend skipped: side not allowed (need {side})")
+        log_warn_throttle(symbol, "side_not_allowed_trend", f"⚠️ {symbol} entry_trend skipped: side not allowed (need {side})")
         return out
     closes=sr.get("closes",[])
     mid=(best_bid+best_ask)/2
@@ -631,10 +659,10 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
         tol = get_param(symbol,"trend_price_tolerance_pct") or 0.005
         # Allow some leeway from recent highs/lows using configurable tolerance
         if side=="Buy" and mid<max(closes[-20:])*(1-tol):
-            logger.warning(f"⚠️ {symbol} entry_trend skipped: price below recent highs")
+            log_warn_throttle(symbol, "price_below_highs", f"⚠️ {symbol} entry_trend skipped: price below recent highs")
             return out
         if side=="Sell" and mid>min(closes[-20:])*(1+tol):
-            logger.warning(f"⚠️ {symbol} entry_trend skipped: price above recent lows")
+            log_warn_throttle(symbol, "price_above_lows", f"⚠️ {symbol} entry_trend skipped: price above recent lows")
             return out
     entry=round_tick(best_ask if side=="Buy" else best_bid,sinfo)
     sl_dist=atr*get_param(symbol,"trend_sl_atr_mult") if atr>0 else entry*0.005
@@ -644,7 +672,7 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"TREND")),sinfo)
     if not qty or qty<sinfo.get("min_qty",0):
-        logger.warning(f"⚠️ {symbol} entry_trend skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        log_warn_throttle(symbol, "qty_below_min_trend", f"⚠️ {symbol} entry_trend skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
         return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
     if not order:
@@ -660,7 +688,7 @@ async def entry_swing(symbol,mid,sinfo):
     out=[]
     kl=await get_klines(symbol,"60",60)
     if not kl:
-        logger.warning(f"⚠️ {symbol} entry_swing skipped: no klines 60")
+        log_warn_throttle(symbol, "no_klines_60", f"⚠️ {symbol} entry_swing skipped: no klines 60")
         return out
     t60=ema_trend([float(k[4]) for k in kl])
     atr1h=calc_atr(kl,CONFIG["atr_period"])
@@ -671,15 +699,15 @@ async def entry_swing(symbol,mid,sinfo):
     elif t60=="BEARISH" and mid>=res*(1-0.5*atr1h/res):
         side="Sell";entry=res*(1-0.0002);sl=entry+atr1h*get_param(symbol,"swing_sl_atr_mult");tp=entry-atr1h*get_param(symbol,"swing_tp_atr_mult")
     if not side:
-        logger.warning(f"⚠️ {symbol} entry_swing skipped: no side (1h trend/zone)")
+        log_warn_throttle(symbol, "no_side_swing", f"⚠️ {symbol} entry_swing skipped: no side (1h trend/zone)")
         return out
     if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
-        logger.warning(f"⚠️ {symbol} entry_swing skipped: side not allowed (need {side})")
+        log_warn_throttle(symbol, "side_not_allowed_swing", f"⚠️ {symbol} entry_swing skipped: side not allowed (need {side})")
         return out
     entry=round_tick(entry,sinfo);sl_dist=abs(entry-sl)
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"SWING")*get_param(symbol,"swing_risk_mult")),sinfo)
     if not qty or qty<sinfo.get("min_qty",0):
-        logger.warning(f"⚠️ {symbol} entry_swing skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        log_warn_throttle(symbol, "qty_below_min_swing", f"⚠️ {symbol} entry_swing skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
         return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
     if not order:
@@ -695,13 +723,13 @@ async def entry_swing(symbol,mid,sinfo):
 async def entry_grid(symbol,mid,sinfo):
     out=[]
     if get_param(symbol,"allowed_side") not in (None,"BOTH","Buy"):
-        logger.warning(f"⚠️ {symbol} entry_grid skipped: Buy not allowed")
+        log_warn_throttle(symbol, "buy_not_allowed_grid", f"⚠️ {symbol} entry_grid skipped: Buy not allowed")
         return out
     levels=get_param(symbol,"grid_levels");step=get_param(symbol,"grid_step_pct")
     open_grid=sum(1 for p in state.open_positions.values() if p["strategy"]=="GRID")
     pend_grid=sum(1 for po in state.pending_orders if po.strategy=="GRID")
     if open_grid+pend_grid>=levels:
-        logger.warning(f"⚠️ {symbol} entry_grid skipped: grid levels exhausted ({open_grid+pend_grid}/{levels})")
+        log_warn_throttle(symbol, "grid_levels_exhausted", f"⚠️ {symbol} entry_grid skipped: grid levels exhausted ({open_grid+pend_grid}/{levels})")
         return out
     for i in range(1,levels+1):
         price=round_tick(mid*(1-i*step),sinfo)
@@ -713,7 +741,7 @@ async def entry_grid(symbol,mid,sinfo):
         if not qty or qty<sinfo.get("min_qty",0):continue
         order=paper_engine.place_limit_order(symbol,"Buy",qty,price)
         if not order:
-            logger.warning(f"⚠️ GRID {symbol}: не хватает средств на уровень {i}")
+            log_warn_throttle(symbol, "grid_no_funds", f"⚠️ GRID {symbol}: не хватает средств на уровень {i}")
             continue
         state.daily_commission+=order["commission"]
         tp=price*(1+step*get_param(symbol,"grid_tp_mult"))
@@ -725,11 +753,11 @@ async def entry_grid(symbol,mid,sinfo):
 
 async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
     if not bo.get("active"):
-        logger.warning(f"⚠️ {symbol} entry_breakout skipped: no breakout active")
+        log_warn_throttle(symbol, "no_bo_active", f"⚠️ {symbol} entry_breakout skipped: no breakout active")
         return None
     side=bo["side"]
     if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
-        logger.warning(f"⚠️ {symbol} entry_breakout skipped: side not allowed (need {side})")
+        log_warn_throttle(symbol, "side_not_allowed_breakout", f"⚠️ {symbol} entry_breakout skipped: side not allowed (need {side})")
         return None
     entry=best_ask if side=="Buy" else best_bid
     sl_dist=max(atr*get_param(symbol,"breakout_sl_atr_mult"),entry*0.006) if atr>0 else entry*0.01
@@ -739,7 +767,7 @@ async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"BREAKOUT")),sinfo)
     if not qty or qty<sinfo.get("min_qty",0):
-        logger.warning(f"⚠️ {symbol} entry_breakout skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        log_warn_throttle(symbol, "qty_below_min_breakout", f"⚠️ {symbol} entry_breakout skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
         return None
     order=paper_engine.place_market_order(symbol,side,qty,entry)
     if not order:
@@ -864,10 +892,10 @@ async def analysis_loop():
                                     calc_qty = calc_qty2
                                     rm = pass_rm
                                 else:
-                                    logger.warning(f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty} even after bump to {pass_rm}")
+                                    log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty} even after bump to {pass_rm}")
                                     skip_size=True
                             else:
-                                logger.warning(f"⚠️ {symbol} skip_size: locked override prevents size bump; qty {calc_qty} < min_qty {min_qty}")
+                                log_warn_throttle(symbol, "skip_size_locked", f"⚠️ {symbol} skip_size: locked override prevents size bump; qty {calc_qty} < min_qty {min_qty}")
                                 skip_size=True
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
