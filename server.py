@@ -318,6 +318,9 @@ class PaperTradingEngine:
         return net,gross,exit_commission
 paper_engine=PaperTradingEngine(CONFIG["virtual_balance"])
 
+from utils import compute_required_rm
+
+
 def compute_size(symbol,entry,sl_distance,rm):
     # Если rm=0 (канарейка OFF), возвращаем 0 - торговля заблокирована
     if rm==0 or entry==0:
@@ -857,9 +860,16 @@ async def analysis_loop():
                         state.recommended[symbol]=rec;state.rec_reason[symbol]=reason
                     setv=get_param(symbol,"strategy") or "AUTO"
                     if setv=="AUTO":
-                        active=get_param(symbol,"adapter_strategy") or state.recommended.get(symbol,rec)
-                    else:active=setv
-                    if setv=="AUTO" and bo.get("active"):active="BREAKOUT"
+                        # If adapter override exists use it; else if analyzer recommended FEE_NEGATIVE treat as OFF
+                        active_override = get_param(symbol,"adapter_strategy")
+                        if active_override:
+                            active = active_override
+                        else:
+                            active = state.recommended.get(symbol,rec) if rec!="FEE_NEGATIVE" else "OFF"
+                    else:
+                        active=setv
+                    if setv=="AUTO" and bo.get("active"):
+                        active="BREAKOUT"
                     sinfo=await get_symbol_info(symbol)
                     # Оценка ожидаемого размера позиции для readiness (calc_qty)
                     calc_qty=0
@@ -873,30 +883,41 @@ async def analysis_loop():
                         min_qty = sinfo.get("min_qty",0)
                         if calc_qty < min_qty:
                             ov = CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
-                            if not ov.get("locked", False):
-                                try:
-                                    if calc_qty>0 and rm>0:
-                                        required_ratio = float(min_qty) / float(calc_qty)
-                                        pass_rm = min(1.0, rm * required_ratio * 1.2)
-                                    else:
-                                        pass_rm = min(1.0, (rm or 1.0) * 1.2)
-                                    raw_qty2 = compute_size(symbol, mid, sl_dist, pass_rm)
-                                    calc_qty2 = round_qty(raw_qty2, sinfo)
-                                except Exception:
-                                    calc_qty2 = 0; pass_rm = rm
-                                if calc_qty2 >= min_qty:
-                                    old_rm = ov.get("risk_mult")
-                                    ov["risk_mult"] = pass_rm
-                                    adapter.adapter.log(symbol, "risk_mult", old_rm, pass_rm, f"auto-size bump to pass min_qty ({calc_qty}->{calc_qty2})")
-                                    config_api._save()
-                                    calc_qty = calc_qty2
-                                    rm = pass_rm
-                                else:
-                                    log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty} even after bump to {pass_rm}")
-                                    skip_size=True
-                            else:
-                                log_warn_throttle(symbol, "skip_size_locked", f"⚠️ {symbol} skip_size: locked override prevents size bump; qty {calc_qty} < min_qty {min_qty}")
+                            # If pair is locked strictly, do not attempt bump
+                            if ov.get("locked", False) and CONFIG.get("locked_strict", False):
+                                log_warn_throttle(symbol, "skip_size_locked", f"⚠️ {symbol} skip_size: locked_strict prevents size bump; qty {calc_qty} < min_qty {min_qty}")
                                 skip_size=True
+                            else:
+                                try:
+                                    # Deterministic required_rm per TASK 2.3
+                                    required_rm = compute_required_rm(min_qty, mid, paper_engine.balance, get_param(symbol,"margin_pct"), CONFIG["leverage"])
+                                    if required_rm > 1.0:
+                                        # Impossible to reach min_qty even with rm=1.0
+                                        log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty}; required_rm {required_rm:.3f} > 1.0 -> skip")
+                                        skip_size=True
+                                    else:
+                                        # New risk_mult is max(current_rm, required_rm) but not more than 1.0
+                                        new_rm = min(1.0, max(rm, required_rm))
+                                        # If pair was locked (but not locked_strict), ensure we respect a minimum floor for locked bumps
+                                        if ov.get("locked", False):
+                                            new_rm = max(new_rm, 0.25)
+                                        old_rm = ov.get("risk_mult")
+                                        ov["risk_mult"] = new_rm
+                                        adapter.adapter.log(symbol, "risk_mult", old_rm, new_rm, f"auto-size deterministic bump to pass min_qty ({calc_qty} -> target_rm {required_rm:.4f} -> rm {new_rm:.3f})")
+                                        config_api._save()
+                                        # Recompute qty with bumped rm
+                                        raw_qty2 = compute_size(symbol, mid, sl_dist, new_rm)
+                                        calc_qty2 = round_qty(raw_qty2, sinfo)
+                                        if calc_qty2 >= min_qty:
+                                            calc_qty = calc_qty2
+                                            rm = new_rm
+                                        else:
+                                            # Should not usually happen, but treat as skip
+                                            log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty} after deterministic bump to {new_rm}")
+                                            skip_size=True
+                                except Exception as e:
+                                    logger.error(f"size-bump error for {symbol}: {e}")
+                                    skip_size=True
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
                     hour_ok=datetime.now().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
