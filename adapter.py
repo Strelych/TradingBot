@@ -43,9 +43,33 @@ class Adapter:
         self.kn_cur.execute("INSERT INTO adaptive_log(ts,symbol,param,old,new,reason) VALUES(?,?,?,?,?,?)",
             (time.time(),symbol,param,str(old),str(new),reason))
     def bump(self,note):
-        self.version+=1
+        """Record a new config_versions entry only if overrides changed since last version.
+        Avoid noisy duplicate entries when nothing actually changed.
+        """
+        try:
+            cur_overrides = json.dumps(self.CONFIG.get("pair_overrides",{}), sort_keys=True)
+        except Exception:
+            cur_overrides = json.dumps(self.CONFIG.get("pair_overrides",{}))
+        # fetch last overrides
+        self.kn_cur.execute("SELECT overrides FROM config_versions ORDER BY version DESC LIMIT 1")
+        r = self.kn_cur.fetchone()
+        last_overrides = (r[0] if r and r[0] is not None else None)
+        if last_overrides is not None:
+            try:
+                # normalize JSON string for comparison
+                import json as _json
+                last_norm = _json.dumps(_json.loads(last_overrides), sort_keys=True)
+            except Exception:
+                last_norm = last_overrides
+        else:
+            last_norm = None
+        # If overrides identical, do not create a new version entry
+        if last_norm == cur_overrides:
+            return
+        # Otherwise insert new version
+        self.version += 1
         self.kn_cur.execute("INSERT INTO config_versions(ts,version,overrides,note) VALUES(?,?,?,?)",
-            (time.time(),self.version,json.dumps(self.CONFIG.get("pair_overrides",{})),note))
+            (time.time(),self.version,cur_overrides,note))
     def save_knowledge(self,symbol,strat,rm,reason,locked):
         # Do not overwrite pair_knowledge for locked pairs — adapter must not change locked settings (PR2 §4.4)
         if locked:
