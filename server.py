@@ -37,7 +37,9 @@ CONFIG={
  "breakout_cooldown_seconds":7200,"breakout_time_stop":21600,
  "min_atr_pct_abs":0.0016,"trading_hours_blacklist":[],
  "max_spread_pct":0.0006,"atr_period":14,
+ "trend_price_tolerance_pct":0.005,
  "require_trend_alignment":True,"mtf_timeframes":["5","15"],"mtf_min_confirms":2,
+ "adapter_hysteresis_count":3,"canary_fraction":0.25,
  "loss_cooldown_seconds":60,"min_atr_rel":0.4,"max_atr_rel":4.0,
  "adaptive_enabled":True,"min_sample":20,"hysteresis":21600,
  "commission_maker":0.00036,"commission_taker":0.001,
@@ -567,16 +569,26 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         state.imbalance_counters[symbol]=state.imbalance_counters.get(symbol,0)-1
         if state.imbalance_counters[symbol]<=-get_param(symbol,"imbalance_confirmation_ticks"):need_side="Sell"
     else:state.imbalance_counters[symbol]=0
-    if not need_side:return out
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=need_side:return out
+    if not need_side:
+        logger.warning(f"⚠️ {symbol} entry_wall skipped: no imbalance/need_side")
+        return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=need_side:
+        logger.warning(f"⚠️ {symbol} entry_wall skipped: side not allowed (need {need_side})")
+        return out
     if CONFIG["require_trend_alignment"]:
         need="BULLISH" if need_side=="Buy" else "BEARISH"
-        if trend1!=need or sum(1 for tf in mtf.values() if tf==need)<get_param(symbol,"mtf_min_confirms"):return out
+        if trend1!=need or sum(1 for tf in mtf.values() if tf==need)<get_param(symbol,"mtf_min_confirms"):
+            logger.warning(f"⚠️ {symbol} entry_wall skipped: trend not aligned (need {need})")
+            return out
     walls=[w for w in wall_tracker.valid(symbol) if w["side"]==("bid" if need_side=="Buy" else "ask")]
-    if not walls:return out
+    if not walls:
+        logger.warning(f"⚠️ {symbol} entry_wall skipped: no walls")
+        return out
     wall=min(walls,key=lambda w:abs(w["price"]-mid))
     fp=best_ask if need_side=="Buy" else best_bid
-    if abs(fp-mid)/mid>0.001:return out
+    if abs(fp-mid)/mid>0.001:
+        logger.warning(f"⚠️ {symbol} entry_wall skipped: price far from mid (fp={fp} mid={mid})")
+        return out
     entry=round_tick(wall["price"]*(1+CONFIG["limit_order_offset_pct"]) if need_side=="Buy" else wall["price"]*(1-CONFIG["limit_order_offset_pct"]),sinfo)
     wall_sl=wall["price"]*(1-get_param(symbol,"sl_behind_wall_pct")) if need_side=="Buy" else wall["price"]*(1+get_param(symbol,"sl_behind_wall_pct"))
     floor=entry*(1-get_param(symbol,"min_sl_distance_pct")) if need_side=="Buy" else entry*(1+get_param(symbol,"min_sl_distance_pct"))
@@ -588,9 +600,13 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         r=tp_to_round(tp,need_side)
         if (need_side=="Buy" and r>entry) or (need_side=="Sell" and r<entry):tp=r
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"WALL")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):
+        logger.warning(f"⚠️ {symbol} entry_wall skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return out
     order=paper_engine.place_limit_order(symbol,need_side,qty,entry)
-    if not order:return out
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_wall skipped: order placement failed")
+        return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,need_side,entry,qty,
         f"Bounce от {wall['side']}-стены @ {round_price(wall['price'])}",order["margin"],order["commission"],
@@ -603,13 +619,23 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     side=None
     if trend1=="BULLISH" and sum(1 for v in mtf.values() if v=="BULLISH")>=get_param(symbol,"mtf_min_confirms") and imbalance>-0.2:side="Buy"
     elif trend1=="BEARISH" and sum(1 for v in mtf.values() if v=="BEARISH")>=get_param(symbol,"mtf_min_confirms") and imbalance<0.2:side="Sell"
-    if not side:return out
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return out
+    if not side:
+        logger.warning(f"⚠️ {symbol} entry_trend skipped: no side (trend/mtf/imbalance)")
+        return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
+        logger.warning(f"⚠️ {symbol} entry_trend skipped: side not allowed (need {side})")
+        return out
     closes=sr.get("closes",[])
     mid=(best_bid+best_ask)/2
     if closes:
-        if side=="Buy" and mid<max(closes[-20:])*0.999:return out
-        if side=="Sell" and mid>min(closes[-20:])*1.001:return out
+        tol = get_param(symbol,"trend_price_tolerance_pct") or 0.005
+        # Allow some leeway from recent highs/lows using configurable tolerance
+        if side=="Buy" and mid<max(closes[-20:])*(1-tol):
+            logger.warning(f"⚠️ {symbol} entry_trend skipped: price below recent highs")
+            return out
+        if side=="Sell" and mid>min(closes[-20:])*(1+tol):
+            logger.warning(f"⚠️ {symbol} entry_trend skipped: price above recent lows")
+            return out
     entry=round_tick(best_ask if side=="Buy" else best_bid,sinfo)
     sl_dist=atr*get_param(symbol,"trend_sl_atr_mult") if atr>0 else entry*0.005
     sl=entry-sl_dist if side=="Buy" else entry+sl_dist
@@ -617,9 +643,13 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"TREND")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):
+        logger.warning(f"⚠️ {symbol} entry_trend skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
-    if not order:return out
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_trend skipped: order placement failed")
+        return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,side,entry,qty,f"Trend {trend1} + MTF",
         order["margin"],order["commission"],order["notional"],round_price(sl),tp,"TREND"))
@@ -629,7 +659,9 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
 async def entry_swing(symbol,mid,sinfo):
     out=[]
     kl=await get_klines(symbol,"60",60)
-    if not kl:return out
+    if not kl:
+        logger.warning(f"⚠️ {symbol} entry_swing skipped: no klines 60")
+        return out
     t60=ema_trend([float(k[4]) for k in kl])
     atr1h=calc_atr(kl,CONFIG["atr_period"])
     sup=min(float(k[3]) for k in kl[-50:]);res=max(float(k[2]) for k in kl[-50:])
@@ -638,13 +670,21 @@ async def entry_swing(symbol,mid,sinfo):
         side="Buy";entry=sup*(1+0.0002);sl=entry-atr1h*get_param(symbol,"swing_sl_atr_mult");tp=entry+atr1h*get_param(symbol,"swing_tp_atr_mult")
     elif t60=="BEARISH" and mid>=res*(1-0.5*atr1h/res):
         side="Sell";entry=res*(1-0.0002);sl=entry+atr1h*get_param(symbol,"swing_sl_atr_mult");tp=entry-atr1h*get_param(symbol,"swing_tp_atr_mult")
-    if not side:return out
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return out
+    if not side:
+        logger.warning(f"⚠️ {symbol} entry_swing skipped: no side (1h trend/zone)")
+        return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
+        logger.warning(f"⚠️ {symbol} entry_swing skipped: side not allowed (need {side})")
+        return out
     entry=round_tick(entry,sinfo);sl_dist=abs(entry-sl)
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"SWING")*get_param(symbol,"swing_risk_mult")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):
+        logger.warning(f"⚠️ {symbol} entry_swing skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
-    if not order:return out
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_swing skipped: order placement failed")
+        return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,side,entry,qty,f"Swing 1h {t60} от зоны",
         order["margin"],order["commission"],order["notional"],round_price(sl),round_price(tp),"SWING",
@@ -654,11 +694,15 @@ async def entry_swing(symbol,mid,sinfo):
 
 async def entry_grid(symbol,mid,sinfo):
     out=[]
-    if get_param(symbol,"allowed_side") not in (None,"BOTH","Buy"):return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH","Buy"):
+        logger.warning(f"⚠️ {symbol} entry_grid skipped: Buy not allowed")
+        return out
     levels=get_param(symbol,"grid_levels");step=get_param(symbol,"grid_step_pct")
     open_grid=sum(1 for p in state.open_positions.values() if p["strategy"]=="GRID")
     pend_grid=sum(1 for po in state.pending_orders if po.strategy=="GRID")
-    if open_grid+pend_grid>=levels:return out
+    if open_grid+pend_grid>=levels:
+        logger.warning(f"⚠️ {symbol} entry_grid skipped: grid levels exhausted ({open_grid+pend_grid}/{levels})")
+        return out
     for i in range(1,levels+1):
         price=round_tick(mid*(1-i*step),sinfo)
         if any(abs(po.price-price)<price*0.0005 for po in state.pending_orders):continue
@@ -680,9 +724,13 @@ async def entry_grid(symbol,mid,sinfo):
     return out
 
 async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
-    if not bo.get("active"):return None
+    if not bo.get("active"):
+        logger.warning(f"⚠️ {symbol} entry_breakout skipped: no breakout active")
+        return None
     side=bo["side"]
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return None
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
+        logger.warning(f"⚠️ {symbol} entry_breakout skipped: side not allowed (need {side})")
+        return None
     entry=best_ask if side=="Buy" else best_bid
     sl_dist=max(atr*get_param(symbol,"breakout_sl_atr_mult"),entry*0.006) if atr>0 else entry*0.01
     sl=entry-sl_dist if side=="Buy" else entry+sl_dist
@@ -690,9 +738,13 @@ async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)*2
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"BREAKOUT")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return None
+    if not qty or qty<sinfo.get("min_qty",0):
+        logger.warning(f"⚠️ {symbol} entry_breakout skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return None
     order=paper_engine.place_market_order(symbol,side,qty,entry)
-    if not order:return None
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_breakout skipped: market order failed")
+        return None
     state.daily_commission+=order["commission"]
     return {"side":side,"entry":entry,"qty":qty,"order":order,"sl":round_price(sl),"tp":tp,
             "time_stop":get_param(symbol,"breakout_time_stop"),
@@ -781,6 +833,13 @@ async def analysis_loop():
                     else:active=setv
                     if setv=="AUTO" and bo.get("active"):active="BREAKOUT"
                     sinfo=await get_symbol_info(symbol)
+                    # Оценка ожидаемого размера позиции для readiness (calc_qty)
+                    calc_qty=0
+                    if active not in ("OFF",) and mid>0 and sinfo:
+                        sl_dist=mid*0.01
+                        rm=eff_risk_mult(symbol,active)
+                        raw_qty=compute_size(symbol,mid,sl_dist,rm)
+                        calc_qty=round_qty(raw_qty,sinfo)
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
                     hour_ok=datetime.now().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
@@ -797,6 +856,7 @@ async def analysis_loop():
                     ck("спред",spread_pct<=CONFIG["max_spread_pct"]);ck("кулдаун",not in_cool)
                     ck("лимиты",entry_allowed(symbol));ck("час",hour_ok)
                     ck("слоты",len(state.open_positions)<CONFIG["max_open_positions"] and len(state.pending_orders)<CONFIG["max_pending_orders"])
+                    ck("размер", calc_qty>=(sinfo.get("min_qty",0) if sinfo else 0))
                     miss=None
                     if not state.is_trading:miss="торговля выключена"
                     elif is_stale:miss="стакан устарел"
@@ -804,7 +864,11 @@ async def analysis_loop():
                     elif not hour_ok:miss="час в блэклисте"
                     elif not entry_allowed(symbol):miss="лимиты дня/экспозиции"
                     elif spread_pct>CONFIG["max_spread_pct"]:miss="широкий спред"
-                    elif not(len(state.open_positions)<CONFIG["max_open_positions"] and len(state.pending_orders)<CONFIG["max_pending_orders"]):miss="нет слотов"
+                    if not(len(state.open_positions)<CONFIG["max_open_positions"] and len(state.pending_orders)<CONFIG["max_pending_orders"]):
+                        miss="нет слотов"
+                    # Логируем причину блокировки gate для диагностики
+                    if not gate:
+                        logger.debug(f"{symbol} gate blocked: {miss}")
                     else:
                         if active=="WALL":
                             ck("волатильность",vol_ok)
