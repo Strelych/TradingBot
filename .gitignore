@@ -1,5 +1,1 @@
-(config_api.py and web_ui.html are source/config files, no build artifacts, dependencies, or temp files in the changes, so no ignores needed)
-
-```python
-
-```
+(adapter.py, server.py)

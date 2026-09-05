@@ -938,42 +938,10 @@ async def analysis_loop():
                         # Если qty меньше min_qty — попытаться временно поднять risk_mult, если пара не locked
                         min_qty = sinfo.get("min_qty",0)
                         if calc_qty < min_qty:
-                            ov = CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
-                            # If pair is locked strictly, do not attempt bump
-                            if ov.get("locked", False) and CONFIG.get("locked_strict", False):
-                                log_warn_throttle(symbol, "skip_size_locked", f"⚠️ {symbol} skip_size: locked_strict prevents size bump; qty {calc_qty} < min_qty {min_qty}")
-                                skip_size=True
-                            else:
-                                try:
-                                    # Deterministic required_rm per TASK 2.3
-                                    required_rm = compute_required_rm(min_qty, mid, paper_engine.balance, get_param(symbol,"margin_pct"), CONFIG["leverage"])
-                                    if required_rm > 1.0:
-                                        # Impossible to reach min_qty even with rm=1.0
-                                        log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty}; required_rm {required_rm:.3f} > 1.0 -> skip")
-                                        skip_size=True
-                                    else:
-                                        # New risk_mult is max(current_rm, required_rm) but not more than 1.0
-                                        new_rm = min(1.0, max(rm, required_rm))
-                                        # If pair was locked (but not locked_strict), ensure we respect a minimum floor for locked bumps
-                                        if ov.get("locked", False):
-                                            new_rm = max(new_rm, 0.25)
-                                        old_rm = ov.get("risk_mult")
-                                        ov["risk_mult"] = new_rm
-                                        adapter.adapter.log(symbol, "risk_mult", old_rm, new_rm, f"auto-size deterministic bump to pass min_qty ({calc_qty} -> target_rm {required_rm:.4f} -> rm {new_rm:.3f})")
-                                        config_api._save()
-                                        # Recompute qty with bumped rm
-                                        raw_qty2 = compute_size(symbol, mid, sl_dist, new_rm)
-                                        calc_qty2 = round_qty(raw_qty2, sinfo)
-                                        if calc_qty2 >= min_qty:
-                                            calc_qty = calc_qty2
-                                            rm = new_rm
-                                        else:
-                                            # Should not usually happen, but treat as skip
-                                            log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty} after deterministic bump to {new_rm}")
-                                            skip_size=True
-                                except Exception as e:
-                                    logger.error(f"size-bump error for {symbol}: {e}")
-                                    skip_size=True
+                            # Size-bump перенесён в adapter.eval (TASK 2.1)
+                            # Здесь только флаг skip_size для readiness
+                            log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty}; требуется size-bump в адаптере")
+                            skip_size=True
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
                     hour_ok=datetime.now().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
