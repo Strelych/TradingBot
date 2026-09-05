@@ -167,7 +167,7 @@ def get_config() -> Dict[str, Any]:
     if cfg is None:
         raise HTTPException(status_code=500, detail="Configuration not initialized")
     
-    result = {}
+    result = {"_meta": {"version": _state.get("config_version", 0)}}
     with _state["lock"]:
         for k, v in CONFIG_META.items():
             item = dict(v)
