@@ -61,6 +61,7 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
     "canary_ramp_wins": {"group":"Адаптер","type":"int","min":1,"max":10,"step":1,"desc":"Число прибыльных сделок в окне для восстановления риска после canary."},
     "canary_ramp_window": {"group":"Адаптер","type":"int","min":1,"max":10,"step":1,"desc":"Окно последних сделок для проверки canary ramp."},
     "risk_change_cooldown": {"group":"Адаптер","type":"int","min":60,"max":86400,"step":60,"desc":"Cooldown seconds between risk_mult changes (default 21600s = 6h)."},
+    "adapter_mode": {"group":"Адаптер","type":"str","desc":"Режим адаптера: aggressive/balanced/tight/manual"},
     "swing_sl_atr_mult": {"group":"SWING","type":"float","min":1,"max":10,"step":0.5,"desc":"SL = ATR(1h) × N."},
     "swing_tp_atr_mult": {"group":"SWING","type":"float","min":1,"max":15,"step":0.5,"desc":"TP = ATR(1h) × N."},
     "swing_time_stop": {"group":"SWING","type":"int","min":3600,"max":604800,"step":3600,"desc":"Тайм-стоп свинга."},

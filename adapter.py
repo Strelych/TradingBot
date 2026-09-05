@@ -11,6 +11,10 @@ class Adapter:
         self.last_n={};self.last_eval={};self.last_decision={};self.canary={};self.version=0
         # Для гистерезиса смен стратегии: хранит (candidate_strategy, count)
         self._streaks = {}
+        # Для hourly adaptation
+        self.last_hour_adapt = 0
+        # Для auto-rebalance убыточных пар
+        self.last_rebalance_check = 0
     def _init(self):
         conn=sqlite3.connect(KN,check_same_thread=False);c=conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS adaptive_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,
@@ -88,23 +92,49 @@ class Adapter:
         h1,h2=analyzer.halves(rows)
         scores=analyzer.strategy_scores(rows)
         lr=self.read_regime(symbol)
-        reg={"vol_rel":lr[0],"trendiness":lr[1],"wall_share":lr[2]}
+        reg={"vol_rel":lr[0],"trendiness":lr[1],"wall_share":lr[2],"atr_pct":lr[3]}
         bo={"active":bool(lr[4]),"side":lr[5]}
         last_trade=max((r[5] for r in rows),default=0)
         stale=(time.time()-last_trade)>2*3600
         locked=bool(ov.get("locked"))
         current=ov.get("adapter_strategy") or "AUTO"
-        strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale,m,h1,h2,min_sample=self.CONFIG.get("min_sample",20))
+        
+        # --- Режимы адаптера (aggressive/balanced/tight/manual)
+        mode = self.get_param(symbol, "adapter_mode") or "balanced"
+        
+        if mode == "manual":
+            # Адаптер выключен, не трогаем настройки
+            return
+        
+        # Параметры режима
+        if mode == "aggressive":
+            default_rm = 1.0
+            off_floor = -0.01
+            min_sample = 10
+        elif mode == "tight":
+            default_rm = 0.25
+            off_floor = -0.05
+            min_sample = 30
+        else:  # balanced
+            default_rm = 0.5
+            off_floor = -0.03
+            min_sample = 20
+        
+        strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale,m,h1,h2,min_sample=min_sample,off_floor=off_floor)
+        
+        # Если decide_strategy вернул canary (rm=0.5), используем default_rm из режима
+        if abs(rm - 0.5) < 1e-9 and strat != "OFF":
+            rm = default_rm
+            reason = reason + f" | режим {mode} x{default_rm}"
 
         # --- Холодный старт: если мало данных, но ATR явно велик, предпочесть TREND вместо WALL
-        min_sample=self.CONFIG.get("min_sample",20)
         atr_pct=reg.get("atr_pct",0)
         atr_floor=self.CONFIG.get("min_atr_pct_abs",0.0016)
         atr_threshold=max(atr_floor*2,0.0025)
         if m.get("n",0)<min_sample and atr_pct>=atr_threshold and strat=="WALL":
             strat="TREND"
             # по умолчанию даём умеренный risk, но уменьшенный канарейкой при малом числе сделок
-            base_rm = 0.5
+            base_rm = default_rm
             canary = float(self.CONFIG.get("canary_fraction",0.25))
             rm = base_rm * (canary if m.get("n",0)<min_sample else 1.0)
             reason=f"холодный старт: высокий ATR {atr_pct:.5f} -> TREND (canary x{canary})"
@@ -328,6 +358,43 @@ class Adapter:
                             self.bump(f"canary {best}")
                             self.config_api._save()
                 self.kn_conn.commit()
+                
+                # --- Часовая адаптация (раз в 6ч): токсичные часы -> blacklist
+                if time.time() - self.last_hour_adapt > 6*3600:
+                    self.last_hour_adapt = time.time()
+                    for sym in self.CONFIG.get("symbols",[]):
+                        ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
+                        if ov.get("locked"): continue
+                        rows = analyzer.get_rows(self.state.db_conn, sym, 72)
+                        hours = analyzer.hour_stats(rows, worst=5)
+                        toxic_hours = [h["h"] for h in hours if h["net"] < -0.5 and h["n"] >= 3]
+                        if toxic_hours:
+                            current_blacklist = ov.get("trading_hours_blacklist", [])
+                            new_blacklist = list(set(current_blacklist + toxic_hours))
+                            if new_blacklist != current_blacklist:
+                                ov["trading_hours_blacklist"] = new_blacklist
+                                self.log(sym, "trading_hours_blacklist", current_blacklist, new_blacklist, f"часовая адаптация: токсичные {toxic_hours}")
+                                self.bump(f"часы {sym}")
+                                self.config_api._save()
+                
+                # --- Авто-ребаланс убыточных пар (раз в 24ч): 8/10 убыточных -> OFF на 24ч
+                if time.time() - self.last_rebalance_check > 24*3600:
+                    self.last_rebalance_check = time.time()
+                    for sym in self.CONFIG.get("symbols",[]):
+                        ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
+                        if ov.get("locked"): continue
+                        rows = analyzer.get_rows(self.state.db_conn, sym, 24)
+                        if len(rows) >= 10:
+                            last_10 = sorted(rows, key=lambda r: r[5], reverse=True)[:10]
+                            losses = sum(1 for r in last_10 if r[0] <= 0)
+                            if losses >= 8:
+                                cur_strat = ov.get("adapter_strategy")
+                                if cur_strat != "OFF":
+                                    ov["adapter_strategy"] = "OFF"
+                                    ov["risk_mult"] = 0.0
+                                    self.log(sym, "adapter_strategy", cur_strat, "OFF", f"авто-ребаланс: {losses}/10 убыточных за 24ч")
+                                    self.bump(f"авто-OFF {sym}")
+                                    self.config_api._save()
             except Exception as e:
                 print("adapter err:",e)
     # --- состояние для UI ---

@@ -104,7 +104,10 @@ def strategy_scores(rows, min_n=3):
     out={}
     for s,pm in perf_by_strategy(rows).items():
         if pm["n"]==0: continue
-        out[s]={"n":pm["n"],"net":pm["net"],"net_per_trade":round(pm["net"]/pm["n"],4)}
+        net_list = [r[0] for r in rows if r[8] == s]
+        std = statistics.stdev(net_list) if len(net_list) > 1 else 1.0
+        sharpe = pm["net"] / std if std > 0 else pm["net"]
+        out[s]={"n":pm["n"],"net":pm["net"],"net_per_trade":round(pm["net"]/pm["n"],4),"sharpe":round(sharpe,3)}
     return out
 
 def hour_stats(rows, worst=3):
@@ -115,6 +118,30 @@ def hour_stats(rows, worst=3):
     lst=[{"h":h,"net":round(v[0],2),"n":v[1]} for h,v in d.items()]
     lst.sort(key=lambda x:x["net"])
     return lst[:worst]
+
+def quality_score(rows):
+    """Оценка качества сделок: комбинация WR, MFE/MAE ratio, commissions/gross."""
+    if len(rows) < 5:
+        return 0.0
+    
+    m = trade_metrics(rows)
+    wr = m["wr"] / 100.0  # 0..1
+    fees_ratio = m["fees"] / m["gross"] if m["gross"] > 0 else 1.0  # 0..1 (меньше = лучше)
+    
+    # Средний MFE/MAE ratio
+    mfe_list = [r[6] for r in rows if r[6] is not None and r[6] > 0]
+    mae_list = [abs(r[7]) for r in rows if r[7] is not None and r[7] < 0]
+    if mfe_list and mae_list:
+        avg_mfe = statistics.mean(mfe_list)
+        avg_mae = statistics.mean(mae_list)
+        capture_ratio = avg_mfe / (avg_mfe + avg_mae) if (avg_mfe + avg_mae) > 0 else 0.5
+    else:
+        capture_ratio = 0.5
+    
+    # Quality Score = WR * (1 - fees_ratio) * capture_ratio
+    # Идеал: WR=1.0, fees_ratio=0.0, capture_ratio=1.0 → Score=1.0
+    score = wr * (1.0 - min(1.0, fees_ratio)) * capture_ratio
+    return round(score, 3)
 
 def decide_strategy(scores, reg, bo, current, stale, m=None, h1=None, h2=None, min_sample=20, min_n=3, off_floor=-0.03):
     """Decide strategy with cold-start and split-validation (TASK PR1 4.2).
@@ -158,11 +185,12 @@ def decide_strategy(scores, reg, bo, current, stale, m=None, h1=None, h2=None, m
     prof = {s: m for s, m in elig.items() if m.get("net_per_trade", 0) > 0}
 
     if prof:
-        s, b = max(prof.items(), key=lambda kv: kv[1]["net_per_trade"])
-        return s, (1.0 if b.get("n", 0) >= 10 else 0.5), f"лучший net/сделку {b['net_per_trade']:+.3f} (n={b['n']})"
+        # Use Sharpe ratio if available, otherwise net_per_trade
+        s, b = max(prof.items(), key=lambda kv: kv[1].get("sharpe", kv[1]["net_per_trade"]))
+        return s, (1.0 if b.get("n", 0) >= 10 else 0.5), f"лучший Sharpe {b.get('sharpe',0):+.2f} (n={b['n']})"
 
     if elig:
-        s, b = max(elig.items(), key=lambda kv: kv[1]["net_per_trade"])
+        s, b = max(elig.items(), key=lambda kv: kv[1].get("sharpe", kv[1]["net_per_trade"]))
         if b.get("net_per_trade", 0) >= off_floor:
             return s, 0.25, f"пограничный net/сделку {b['net_per_trade']:+.3f} — канарейка ×0.25"
         # If both halves are bad -> OFF with honest 0 risk

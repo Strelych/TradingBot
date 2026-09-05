@@ -519,9 +519,46 @@ async def api_pair_set(symbol:str,payload:dict):
     logger.info(f"🎛️ {symbol} override: {payload}")
     return{"ok":True}
 
+@app.post("/api/adapter/mode/{symbol}")
+async def api_adapter_mode(symbol:str, mode:str):
+    ov=CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
+    ov["adapter_mode"]=mode
+    config_api._save()
+    logger.info(f"🎛️ {symbol} adapter_mode: {mode}")
+    return{"ok":True}
+
 @app.get("/api/adapter")
 async def api_adapter():
     return adapter.adapter.public_state()
+
+@app.get("/api/diag")
+async def api_diag():
+    """Авто-диагностика: причина простоя для каждой пары."""
+    diag = []
+    for symbol in CONFIG["symbols"]:
+        reg = analyzer.regime(state, symbol)
+        ov = CONFIG.get("pair_overrides",{}).get(symbol,{})
+        lr = adapter.adapter.read_regime(symbol)
+        
+        # Определяем причину простоя
+        reason = "торгуется"
+        strat = ov.get("adapter_strategy") or ov.get("strategy")
+        if strat == "OFF":
+            reason = "OFF (адаптер)" if ov.get("adapter_strategy") == "OFF" else "OFF (ручной)"
+        elif lr[3] < 0.0008:
+            reason = f"fee-negative (ATR {lr[3]*100:.3f}% < 0.08%)"
+        elif reg["wall_share"] < 0.3 and strat == "WALL":
+            reason = "нет стен (wall_share < 0.3)"
+        
+        diag.append({
+            "symbol": symbol,
+            "strategy": strat,
+            "risk_mult": ov.get("risk_mult", 0),
+            "atr_pct": lr[3],
+            "wall_share": reg["wall_share"],
+            "reason": reason
+        })
+    return {"diag": diag, "timestamp": time.time()}
 
 @app.get("/api/analytics")
 async def api_analytics():
