@@ -1,4 +1,4 @@
-# server.py - Bybit Scalper v12 (Adaptive Analytics + Readiness + Hot Pairs)
+# server.py - Bybit Scalper v12.6 (Adaptive Analytics + Readiness + Hot Pairs)
 import asyncio, json, time, sqlite3, os, math, traceback
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -10,6 +10,9 @@ from datetime import datetime
 
 from web_ui import WEB_PAGE
 import config_api, analyzer, adapter
+
+VERSION = "v12.6"
+BRANCH = "v12.6"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger=logging.getLogger("BotServer")
@@ -408,8 +411,15 @@ async def lifespan(app):
     asyncio.create_task(bybit_ws_handler())
     state.analysis_task=asyncio.create_task(analysis_loop())
     adapter.adapter.start(state,CONFIG,get_param,config_api)
+    # Очистка спама auto-size из adaptive_log (TASK 2.9)
+    try:
+        adapter.adapter.kn_cur.execute("DELETE FROM adaptive_log WHERE reason LIKE 'auto-size%'")
+        adapter.adapter.kn_conn.commit()
+        logger.info("🧹 Очищен спам auto-size из adaptive_log")
+    except Exception as e:
+        logger.warning(f"Не удалось очистить спам adaptive_log: {e}")
     asyncio.create_task(housekeeping());asyncio.create_task(watchdog())
-    logger.info("✅ Bybit Scalper v12 запущен")
+    logger.info(f"✅ Bybit Scalper {VERSION} запущен")
     yield
     shutdown_cleanup()
     state.save_stats();await close_http_session()
@@ -447,7 +457,7 @@ async def watchdog():
             state.analysis_task=asyncio.create_task(analysis_loop())
             state.last_tick=time.time()
 
-app=FastAPI(title="Bybit Scalper v12",lifespan=lifespan)
+app=FastAPI(title=f"Bybit Scalper {VERSION}",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
 app.include_router(config_api.router)
 @app.get("/",response_class=HTMLResponse)
@@ -505,9 +515,16 @@ async def api_pairs():
     for s in CONFIG["symbols"]:
         reg=analyzer.regime(state,s)
         rec,reason=analyzer.recommend(reg)
+        ov=CONFIG.get("pair_overrides",{}).get(s,{})
+        base_rm=ov.get("risk_mult") or 1.0
+        canary_val=adapter.adapter.canary.get(s)
+        eff_rm=base_rm*(canary_val if canary_val is not None else 1.0)
+        # fee_positive: True если ATR > fee_floor (пара может торговаться в плюс)
+        fee_floor=CONFIG.get("min_atr_pct_abs",0.0016)
+        fee_positive=reg.get("atr_pct",0)>=fee_floor
         out[s]={"set":get_param(s,"strategy") or "AUTO","active":state.recommended.get(s,rec),"rec":rec,
                 "rec_reason":state.rec_reason.get(s,reason),"regime":reg,
-                "overrides":CONFIG.get("pair_overrides",{}).get(s,{})}
+                "overrides":ov,"eff_risk":eff_rm,"fee_positive":fee_positive}
     return out
 
 @app.post("/api/pairs/{symbol}")
@@ -1168,7 +1185,19 @@ async def websocket_endpoint(websocket:WebSocket):
 @app.get("/api/status")
 async def get_status():
     return{"is_trading":state.is_trading,"symbols":CONFIG["symbols"],"ws_connected":state.ws_connected,
-           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors}}
+           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors},
+           "version":VERSION}
+
+@app.get("/api/version")
+async def get_version():
+    cv = 0
+    try:
+        adapter.adapter.kn_cur.execute("SELECT MAX(version) FROM config_versions")
+        r = adapter.adapter.kn_cur.fetchone()
+        cv = r[0] if r and r[0] is not None else 0
+    except Exception:
+        cv = 0
+    return {"version": VERSION, "config_version": cv, "branch": BRANCH}
 
 @app.get("/api/trades")
 async def get_trades(limit:int=1000):

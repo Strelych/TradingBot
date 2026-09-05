@@ -1,4 +1,4 @@
-# TradingBot — Bybit Scalper v12
+# TradingBot — Bybit Scalper v12.6
 
 Адаптивный скальпер Bybit Linear на публичных WS-потоках.
 
