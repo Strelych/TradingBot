@@ -513,6 +513,7 @@ async def api_reset():
 async def api_pairs():
     out={}
     for s in CONFIG["symbols"]:
+        sr=state.support_resistance.get(s,{})
         reg=analyzer.regime(state,s)
         rec,reason=analyzer.recommend(reg)
         ov=CONFIG.get("pair_overrides",{}).get(s,{})
@@ -521,10 +522,12 @@ async def api_pairs():
         eff_rm=base_rm*(canary_val if canary_val is not None else 1.0)
         # fee_positive: True если ATR > fee_floor (пара может торговаться в плюс)
         fee_floor=CONFIG.get("min_atr_pct_abs",0.0016)
-        fee_positive=reg.get("atr_pct",0)>=fee_floor
+        atr_pct=sr.get("atr_pct",0)
+        fee_positive=atr_pct>=fee_floor
         out[s]={"set":get_param(s,"strategy") or "AUTO","active":state.recommended.get(s,rec),"rec":rec,
                 "rec_reason":state.rec_reason.get(s,reason),"regime":reg,
-                "overrides":ov,"eff_risk":eff_rm,"fee_positive":fee_positive}
+                "overrides":ov,"eff_risk":eff_rm,"fee_positive":fee_positive,
+                "atr":sr.get("atr",0),"atr_pct":atr_pct}
     return out
 
 @app.post("/api/pairs/{symbol}")
