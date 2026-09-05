@@ -222,6 +222,7 @@ function closePosition(key){fetch('/api/close/'+encodeURIComponent(key),{method:
 function closeAll(){fetch('/api/close_all',{method:'POST'}).then(r=>r.json()).then(r=>notify('✖ Закрыто всех',r.closed+' позиций','info'))}
 function cancelPending(id){fetch('/api/cancel_pending/'+id,{method:'POST'}).then(()=>showToast('⏰ Отменено','ордер '+id,'info'))}
 function setStrategy(sym,val){fetch('/api/pairs/'+sym,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy:val})}).then(()=>showToast('🎛️ '+sym,'стратегия: '+val+(val!=='AUTO'?' (🔒 locked)':''),'info'))}
+function setAdapterMode(sym,mode){fetch('/api/adapter/mode/'+sym+'/'+mode,{method:'POST'}).then(()=>showToast('🤖 '+sym,'режим адаптера: '+mode,'info'))}
 function rollback(v){if(!confirm('Откатить конфиг к v'+v+'?'))return;fetch('/api/config_rollback/'+v,{method:'POST'}).then(()=>showToast('↩️ Откат','к v'+v,'info'))}
 function fullReset(){if(!confirm('Полный сброс: баланс 500, история удалится (knowledge.db сохранится). Продолжить?'))return;fetch('/api/reset',{method:'POST'}).then(()=>{notify('♻️ Сброс','выполнен','info');loadHistory(true)})}
 function handle(data){
@@ -372,6 +373,8 @@ function renderAnalytics(a){let html='<div class="h-card"><div class="h-head"><s
  '<div>По дням: '+(a.daily||[]).map(d=>d.date.slice(5)+': '+money(d.net)).join(' | ')+'</div></div></div>';
  for(const[sym,p]of Object.entries(a.pairs)){const m=p.metrics||{};const r=p.regime||{};const bo=p.breakout||{};
   let perfHtml=Object.entries(p.perf||{}).map(([s,pm])=>s+': '+pm.n+'сд WR'+pm.wr+'% '+money(pm.net)).join(' | ')||'—';
+  const sc=p.scores||{};const qs=p.quality_score||0;
+  let scoresHtml=Object.entries(sc).map(([s,sc2])=>s+': Sharpe'+sc2.sharpe.toFixed(2)+' (n='+sc2.n+')').join(' | ')||'—';
   html+='<div class="h-card"><div class="h-head"><span class="symbol">'+sym+'</span>'+
   '<span class="strat-badge">актив: '+(p.active_strat||'—')+'</span><span class="h-reason">set: '+(p.set||'AUTO')+'</span>'+
   '<span class="pnl '+cls(m.net||0)+'">'+money(m.net||0)+'</span></div>'+
@@ -380,19 +383,24 @@ function renderAnalytics(a){let html='<div class="h-card"><div class="h-head"><s
   '<div>📊 Выборка: <strong>'+(m.n||0)+'</strong> (72ч) | WR '+(m.wr||0)+'% | ±0: '+(m.breakeven||0)+'</div>'+
   '<div>Gross: '+money(m.gross||0)+' | Комиссии: $'+(m.fees||0).toFixed(2)+' | Fee/Gross: '+(m.gross?(m.fees/m.gross).toFixed(1):'—')+'×</div>'+
   '<div>MFE ср: '+((m.avg_mfe||0)*100).toFixed(2)+'% | MAE ср: '+((m.avg_mae||0)*100).toFixed(2)+'% | inst-stop: '+(m.inst_stop||0)+'</div>'+
+  '<div>Захват прибыли: <b>'+(((m.avg_mfe||0)/((m.avg_mfe||0)+Math.abs(m.avg_mae||0))*100)||0).toFixed(0)+'%</b></div>'+
   '<div>Buy gross: '+money(m.buy_gross||0)+' | Sell gross: '+money(m.sell_gross||0)+'</div>'+
   '<div>🧭 Режим: vol_rel '+(r.vol_rel||0)+' | trend '+(r.trendiness||0)+' | стены '+(r.wall_share||0)+'</div>'+
   '<div>🚀 BREAKOUT: '+(bo.active?('АКТИВЕН '+(bo.side==='Buy'?'↑':'↓')+' '+(bo.range_pct*100).toFixed(1)+'% ×'+bo.vol_ratio):'нет')+'</div>'+
   '<div>🕐 Худшие часы: '+(p.hours||[]).map(h=>h.h+':00('+money(h.net)+')').join(' ')+'</div>'+
   '<div>🏆 По стратегиям: '+perfHtml+'</div>'+
+  '<div>Quality Score: <b>'+qs.toFixed(3)+'</b> (идеал=1.0)</div>'+
+  '<div>📈 Sharpe по стратегиям: '+scoresHtml+'</div>'+
   '<div>🎯 Рекомендация: <strong>'+(p.recommendation||'—')+'</strong> — '+(p.rec_reason||'')+'</div></div></div>'}
  $('analytics-body').innerHTML=html}
 function loadAdapt(){fetch('/api/adapter').then(r=>r.json()).then(renderAdapt).catch(e=>{$('adapt-body').innerHTML='<div class="empty-state">Ошибка загрузки</div>'})}
 function renderAdapt(d){$('adapt-ver').textContent='config v'+(d.version||0);let h='';
- for(const[s,p]of Object.entries(d.pairs)){const dec=p.decision||{};
+ for(const[s,p]of Object.entries(d.pairs)){const dec=p.decision||{};const mode=p.adapter_mode||'balanced';
   h+='<div class="h-card"><div class="h-head"><span class="symbol">'+s+'</span>'+
   '<select class="strat-select" onchange="setStrategy(\''+s+'\',this.value)">'+
   ['AUTO','WALL','TREND','SWING','GRID','BREAKOUT','OFF'].map(x=>'<option '+(x===(p.set||'AUTO')?'selected':'')+' value="'+x+'">'+x+'</option>').join('')+'</select>'+
+  '<select class="strat-select" style="margin-left:6px" onchange="setAdapterMode(\''+s+'\',this.value)">'+
+  [['aggressive','Агрессивный'],['balanced','Сбалансированный'],['tight','Тайтовый'],['manual','Ручной']].map(x=>'<option '+(x[0]===mode?'selected':'')+' value="'+x[0]+'">'+x[1]+'</option>').join('')+'</select>'+
   (p.locked?'<span class="h-reason">🔒 manual</span>':'')+
   (p.canary?'<span class="h-reason">🐣 ×'+p.canary+'</span>':'')+
   '<span class="strat-badge">актив: '+(p.adapter_strategy||p.set||'—')+'</span></div>'+
