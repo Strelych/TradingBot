@@ -224,3 +224,42 @@ async def set_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(f"Symbols hook error: {e}")
     
     return {"ok": True, "restart_required": restart_required}
+
+
+@router.post("/api/config/reset")
+async def reset_config() -> Dict[str, Any]:
+    """Сбрасывает все параметры конфигурации к значениям по умолчанию."""
+    cfg = _state["config"]
+    if cfg is None:
+        raise HTTPException(status_code=500, detail="Configuration not initialized")
+    
+    # Извлекаем дефолтные значения из CONFIG_META (первое значение для list, False для bool)
+    with _state["lock"]:
+        for k, meta in CONFIG_META.items():
+            t = meta.get("type", "float")
+            if t == "bool":
+                default_val = False
+            elif t == "list":
+                default_val = []
+            elif t == "int":
+                default_val = int(meta.get("min", 0))
+            elif t == "float":
+                default_val = float(meta.get("min", 0.0))
+            elif t == "str":
+                default_val = ""
+            else:
+                default_val = None
+            
+            if default_val is not None:
+                cfg[k] = default_val
+        
+        _save()
+    
+    # Вызов хука для обновления символов (если symbols был сброшен)
+    if symbols_hook:
+        try:
+            await symbols_hook(cfg["symbols"])
+        except Exception as e:
+            logger.error(f"Symbols hook error: {e}")
+    
+    return {"ok": True}
