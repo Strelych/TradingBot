@@ -1,1 +1,3 @@
-(adapter.py, server.py)
+(server.py is a source file, so no need to add it to .gitignore)
+
+Nothing to add to .gitignore since only a source file was modified.
