@@ -314,12 +314,12 @@ class Adapter:
                         # pick max atr_pct
                         best = max(candidates, key=lambda x:x[1])[0]
                         ov_best = self.CONFIG.setdefault("pair_overrides",{}).setdefault(best,{})
-                        # set a canary risk_mult=0.5 and adapter_strategy per recommend (if not FEE_NEGATIVE)
+                        # set a canary risk_mult=0.5 and adapter_strategy per recommend (if not OFF)
                         reg = self.read_regime(best)
                         reg_dict={"atr_pct":reg[4],"trendiness":reg[1],"vol_rel":reg[0],"wall_share":reg[2],"min_atr_pct_abs":min_atr}
                         rec, reason = analyzer.recommend(reg_dict)
-                        # Only set if recommended is tradeable (not FEE_NEGATIVE)
-                        if rec != "FEE_NEGATIVE":
+                        # Only set if recommended is tradeable (not OFF)
+                        if rec != "OFF":
                             # write override but respect locked check above
                             old_rm = ov_best.get("risk_mult")
                             ov_best["risk_mult"] = ov_best.get("risk_mult",1.0) * 0.5 if ov_best.get("risk_mult") is not None else 0.5

@@ -860,12 +860,12 @@ async def analysis_loop():
                         state.recommended[symbol]=rec;state.rec_reason[symbol]=reason
                     setv=get_param(symbol,"strategy") or "AUTO"
                     if setv=="AUTO":
-                        # If adapter override exists use it; else if analyzer recommended FEE_NEGATIVE treat as OFF
+                        # If adapter override exists use it; else use analyzer recommendation
                         active_override = get_param(symbol,"adapter_strategy")
                         if active_override:
                             active = active_override
                         else:
-                            active = state.recommended.get(symbol,rec) if rec!="FEE_NEGATIVE" else "OFF"
+                            active = state.recommended.get(symbol,rec)
                     else:
                         active=setv
                     if setv=="AUTO" and bo.get("active"):
