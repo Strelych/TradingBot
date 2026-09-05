@@ -567,12 +567,14 @@ async def api_analytics():
         rows=analyzer.get_rows(state.db_conn,s,72)
         m=analyzer.trade_metrics(rows)
         perf=analyzer.perf_by_strategy(rows)
+        scores=analyzer.strategy_scores(rows)
         hours=analyzer.hour_stats(rows)
         reg=analyzer.regime(state,s)
         rec,reason=analyzer.recommend(reg)
         kl15=await get_klines(s,"15",60)
         bo=analyzer.breakout_state(kl15,get_param(s,"breakout_max_range_pct")) if kl15 else {"active":False}
-        pairs[s]={"metrics":m,"perf":perf,"hours":hours,"regime":reg,"recommendation":rec,"rec_reason":reason,
+        qs=analyzer.quality_score(rows) if len(rows)>=5 else 0.0
+        pairs[s]={"metrics":m,"perf":perf,"scores":scores,"quality_score":qs,"hours":hours,"regime":reg,"recommendation":rec,"rec_reason":reason,
                   "breakout":bo,"progress":min(100,int(100*m.get("n",0)/max(1,get_param(s,"min_sample")))),
                   "set":get_param(s,"strategy") or "AUTO","active_strat":state.recommended.get(s,rec)}
     cur=state.db_cursor
