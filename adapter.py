@@ -144,40 +144,78 @@ class Adapter:
             strat="OFF"
             rm=0.0
             reason=f"FLAT без стен (wall_share={reg.get('wall_share',0):.2f}) -> OFF"
+        
+        # TASK 2.8: Авто-разблокировка stale OFF
+        # Если set==AUTO и adapter_strategy=="OFF" не подтверждён split-валидацией
+        # (обе половины окна < off_floor) за последние 2 eval — сбросить в рекомендацию
+        cur_set = ov.get("strategy") or "AUTO"
+        cur_as = ov.get("adapter_strategy")
+        if cur_set == "AUTO" and cur_as == "OFF" and not locked:
+            # Проверяем split-валидацию: если хотя бы одна половина >= off_floor, OFF не подтверждён
+            h1_net = h1.get("net_per_trade", -999) if h1 else -999
+            h2_net = h2.get("net_per_trade", -999) if h2 else -999
+            off_floor_check = off_floor  # из режима
+            
+            # Если хотя бы одна половина не хуже off_floor, OFF не обоснован
+            if h1_net >= off_floor_check or h2_net >= off_floor_check:
+                # Проверяем последние 2 решения из last_decision
+                prev_decisions = []
+                for i in range(2):
+                    self.kn_cur.execute("SELECT new FROM adaptive_log WHERE symbol=? AND param='adapter_strategy' ORDER BY ts DESC LIMIT 1 OFFSET ?", (symbol, i))
+                    row = self.kn_cur.fetchone()
+                    if row:
+                        prev_decisions.append(row[0])
+                
+                # Если в последних 2 решениях было OFF, но split не подтверждает — сбрасываем
+                if prev_decisions.count("OFF") >= 2:
+                    rec, rec_reason = recommend(reg)
+                    strat = rec
+                    rm = default_rm * 0.5  # канарейка для переразведки
+                    reason = f"авто-разблокировка stale OFF: split-валидация не подтверждает (h1={h1_net:.3f}, h2={h2_net:.3f} vs floor={off_floor_check:.3f}) -> {rec}"
 
         changes=[]
         # --- Гистерезис смен стратегии: применяем изменение только после N подряд рекомендаций (из CONFIG)
         if not locked:
             cur_as=ov.get("adapter_strategy")
             hyst_count = int(self.CONFIG.get("adapter_hysteresis_count",3))
+            
+            # TASK 2.7: Хистерезис первого входа — без стрика на cold-start
+            is_cold_start = m.get("n", 0) < min_sample
+            
             # обработка смены adapter_strategy с гистерезисом
             if cur_as!=strat:
-                st=self._streaks.get(symbol, {"cand":None,"count":0})
-                if st.get("cand")==strat:
-                    st["count"]+=1
+                # Если холодный старт и первая смена OFF->стратегия — применяем сразу (TASK 2.7)
+                if is_cold_start and (cur_as == "OFF" or cur_as is None):
+                    # Первая смена на cold-start — сразу применяем
+                    changes.append(("adapter_strategy",cur_as,strat,reason + " [cold-start first change]"))
+                    self._streaks[symbol]={"cand":None,"count":0}
                 else:
-                    st={"cand":strat,"count":1}
-                self._streaks[symbol]=st
-                # если достигли порога — применяем изменение (но учитываем cooldown по времени)
-                if st["count"]>=hyst_count:
-                    # Enforce time-based cooldown for strategy change (CONFIG['hysteresis'] seconds)
-                    cooldown = int(self.CONFIG.get("hysteresis", 21600))
-                    self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='adapter_strategy' ORDER BY ts DESC LIMIT 1", (symbol,))
-                    last_row = self.kn_cur.fetchone()
-                    last_ts = float(last_row[0]) if last_row else 0
-                    now_ts = time.time()
-                    if last_row and (now_ts - last_ts) < cooldown:
-                        # rate-limited — do not apply, record for observability
-                        self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,
-                                                     "reason":f"rate-limited strategy change ({int(now_ts-last_ts)}s<{cooldown}s): {reason}",
-                                                     "ts":now_ts,"locked":locked}
+                    st=self._streaks.get(symbol, {"cand":None,"count":0})
+                    if st.get("cand")==strat:
+                        st["count"]+=1
                     else:
-                        changes.append(("adapter_strategy",cur_as,strat,reason))
-                        # сбросим стрик после применения
-                        self._streaks[symbol]={"cand":None,"count":0}
-                else:
-                    # не меняем пока не накопим стрик — обновим last_decision для наблюдаемости
-                    self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/{hyst_count}: {reason}","ts":time.time(),"locked":locked}
+                        st={"cand":strat,"count":1}
+                    self._streaks[symbol]=st
+                    # если достигли порога — применяем изменение (но учитываем cooldown по времени)
+                    if st["count"]>=hyst_count:
+                        # Enforce time-based cooldown for strategy change (CONFIG['hysteresis'] seconds)
+                        cooldown = int(self.CONFIG.get("hysteresis", 21600))
+                        self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='adapter_strategy' ORDER BY ts DESC LIMIT 1", (symbol,))
+                        last_row = self.kn_cur.fetchone()
+                        last_ts = float(last_row[0]) if last_row else 0
+                        now_ts = time.time()
+                        if last_row and (now_ts - last_ts) < cooldown:
+                            # rate-limited — do not apply, record for observability
+                            self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,
+                                                         "reason":f"rate-limited strategy change ({int(now_ts-last_ts)}s<{cooldown}s): {reason}",
+                                                         "ts":now_ts,"locked":locked}
+                        else:
+                            changes.append(("adapter_strategy",cur_as,strat,reason))
+                            # сбросим стрик после применения
+                            self._streaks[symbol]={"cand":None,"count":0}
+                    else:
+                        # не меняем пока не накопим стрик — обновим last_decision для наблюдаемости
+                        self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/{hyst_count}: {reason}","ts":time.time(),"locked":locked}
             else:
                 # совпадение с текущей стратегией — сброс стрика
                 self._streaks[symbol]={"cand":None,"count":0}
@@ -188,12 +226,33 @@ class Adapter:
                 # If we're setting risk_mult to zero, include split-halves info in the log per PR2 §4.4
                 if abs(rm) < 1e-9:
                     rm_reason = reason + f" | halves: h1={h1}, h2={h2}"
-                # Rate-limit risk_mult changes to once per cooldown (default 6h) per PR3 §4.5
+                
+                # TASK 2.6: Исключения из risk_change_cooldown
+                # Не применяется при: cold-start (n < min_sample), size-bump, первая смена OFF->стратегия
                 cooldown = float(self.CONFIG.get("risk_change_cooldown", 21600))
+                skip_cooldown = False
+                
+                # Проверка на cold-start
+                if m.get("n", 0) < min_sample:
+                    skip_cooldown = True
+                    rm_reason = rm_reason + " [cold-start]"
+                
+                # Проверка на size-bump (если причина содержит size-bump)
+                if "size-bump" in rm_reason.lower():
+                    skip_cooldown = True
+                    rm_reason = rm_reason + " [size-bump]"
+                
+                # Проверка на первую смену OFF->стратегия
+                cur_strat = ov.get("adapter_strategy") or "OFF"
+                if cur_strat == "OFF" and strat != "OFF":
+                    skip_cooldown = True
+                    rm_reason = rm_reason + " [first OFF->strat]"
+                
                 self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='risk_mult' ORDER BY ts DESC LIMIT 1",(symbol,))
                 last = self.kn_cur.fetchone()
                 now_ts = time.time()
-                if last and (now_ts - float(last[0]) < cooldown):
+                
+                if last and not skip_cooldown and (now_ts - float(last[0]) < cooldown):
                     # Skip applying risk change due to cooldown; record decision for observability
                     self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,"reason":f"rate-limited risk change ({int(now_ts-last[0])}s<{int(cooldown)}s): {rm_reason}","ts":now_ts,"locked":locked}
                 else:
@@ -270,6 +329,45 @@ class Adapter:
             # Не ломаем адаптер из-за логики allowed_side
             pass
 
+        # --- Size-bump по эффективному множителю (TASK 2.2) ---
+        # Эффектив = база x canary. Формула: new_rm = min(2.0, required_rm / max(canary, 0.05))
+        # Проверяем только если стратегия не OFF и есть позиция или готовность к входу
+        if strat != "OFF":
+            # Получаем min_qty для символа
+            sinfo = self.state.symbols_info.get(symbol, {})
+            min_qty = sinfo.get("min_qty", 0)
+            if min_qty > 0:
+                # Берём последнюю цену из orderbook или last_prices
+                mid = 0.0
+                ob = self.state.orderbooks.get(symbol, {})
+                if ob and ob.get("bids") and ob.get("asks"):
+                    mid = (float(ob["bids"][0][0]) + float(ob["asks"][0][0])) / 2
+                else:
+                    mid = self.state.last_prices.get(symbol, 0.0)
+                
+                if mid > 0:
+                    from utils import compute_required_rm
+                    balance = self.state.paper_engine.balance if hasattr(self.state, 'paper_engine') else 500.0
+                    margin_pct = self.get_param(symbol, "margin_pct") or 0.01
+                    leverage = self.CONFIG.get("leverage", 5)
+                    
+                    required_rm = compute_required_rm(min_qty, mid, balance, margin_pct, leverage)
+                    
+                    # Вычисляем canary (эффективный множитель)
+                    canary_val = self.canary.get(symbol, 1.0)
+                    effective_multiplier = max(canary_val, 0.05)
+                    
+                    # Если required_rm > текущий rm * canary, нужно сделать bump
+                    current_effective = rm * effective_multiplier
+                    if required_rm > current_effective and required_rm <= 2.0:
+                        # Формула bump по эффективному множителю
+                        new_rm = min(2.0, required_rm / effective_multiplier)
+                        if abs(new_rm - rm) > 1e-9:
+                            old_rm = rm
+                            rm = new_rm
+                            reason = reason + f" | size-bump eff: req={required_rm:.3f} eff_mult={effective_multiplier:.3f} -> rm={new_rm:.3f}"
+                            self.log(symbol, "risk_mult", old_rm, new_rm, reason)
+        
         # Сохраним целевой (базовый) rm до применения canary — он нам понадобится для возможного рапма
         target_rm = rm
         # Если мало данных по паре — дополнительно уменьшить риск по canary_fraction
