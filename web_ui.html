@@ -229,8 +229,13 @@
   <div id="adapt-body"></div></div>
 </div>
 <div id="tab-settings" style="display:none">
- <div class="section"><div class="history-toolbar"><button class="btn btn-sm btn-refresh" onclick="loadConfig()">🔄 Обновить</button>
-  <span style="color:#8b949e;font-size:12px">Изменения применяются сразу; «рестарт» — после перезапуска</span></div>
+ <div class="section"><div class="history-toolbar">
+  <button class="btn btn-sm btn-refresh" onclick="loadConfig()">🔄 Обновить</button>
+  <button class="btn btn-sm" onclick="saveAllConfig()" style="background:var(--green);color:#fff;margin-left:8px">💾 Применить все</button>
+  <button class="btn btn-sm" onclick="resetAllDefaults()" style="background:var(--card2);color:var(--text);margin-left:8px;border:1px solid var(--border)">↻ Сбросить всё</button>
+  <input type="text" id="config-search" placeholder="🔍 Поиск..." oninput="filterConfig()" style="margin-left:auto;width:200px;background:var(--card2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+ </div>
+  <span style="color:#8b949e;font-size:12px">Изменения применяются сразу; «рестарт» — после перезапуска <span id="restart-pending" style="display:none;color:var(--amber);font-weight:bold">| ⚠️ Требуется рестарт</span></span></div>
   <div id="config-groups"></div></div>
 </div>
 </div>
@@ -463,11 +468,12 @@ function renderAdapt(d){$('adapt-ver').textContent='config v'+(d.version||0);let
  h+='<div class="h-card"><div class="h-head"><span class="symbol">🕘 Версии конфига</span></div>'+
   (d.versions&&d.versions.length?d.versions.map(v=>'<div class="h-details"><div>v'+v.version+' | '+new Date(v.ts*1000).toLocaleString()+' | '+v.note+' <button class="btn btn-sm btn-refresh" onclick="rollback('+v.version+')">↩️</button></div></div>').join(''):'<div class="empty-state">Пока пусто</div>')+'</div>';
  $('adapt-body').innerHTML=h}
-function loadConfig(){fetch('/api/config').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(cfg=>{renderConfig(cfg);if(cfg._meta&&cfg._meta.version){$('config-badge').textContent='config v'+cfg._meta.version}}).catch(e=>{$('config-groups').innerHTML='<div class="empty-state">⚠️ '+e.message+'</div>'})}
+function loadConfig(){fetch('/api/config').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(cfg=>{renderConfig(cfg);if(cfg._meta&&cfg._meta.version){$('config-badge').textContent='config v'+cfg._meta.version};$('restart-pending').style.display='none';window.configCache=cfg}).catch(e=>{$('config-groups').innerHTML='<div class="empty-state">⚠️ '+e.message+'</div>'})}
+let configInputs={};
 function renderConfig(cfg){const groups={};for(const[k,m]of Object.entries(cfg)){if(typeof m!=='object'||!m||k==='_meta')continue;(groups[m.group]=groups[m.group]||[]).push([k,m])}
- const root=$('config-groups');root.innerHTML='';for(const[g,items]of Object.entries(groups)){const sec=document.createElement('div');sec.className='section';
+ const root=$('config-groups');root.innerHTML='';window.configInputs={};for(const[g,items]of Object.entries(groups)){const sec=document.createElement('div');sec.className='section';
  sec.innerHTML='<div class="section-title">'+g+'</div>';items.forEach(([k,m])=>sec.appendChild(configRow(k,m)));root.appendChild(sec)}}
-function configRow(key,m){const row=document.createElement('div');row.className='h-card';
+function configRow(key,m){const row=document.createElement('div');row.className='h-card';row.dataset.key=key.toLowerCase();
  const badge=m.restart?' <span class="h-reason" style="color:#d29922">рестарт</span>':'';
  row.innerHTML='<div class="h-head"><span class="symbol">'+key+'</span>'+badge+'<span class="cfg-controls"></span></div>'+
  '<details style="margin-top:4px"><summary style="cursor:pointer;color:#8b949e;font-size:11px">описание</summary>'+
@@ -478,15 +484,17 @@ function configRow(key,m){const row=document.createElement('div');row.className=
  if(m.type==='bool'){input=document.createElement('input');input.type='checkbox';input.checked=!!m.value}
  else if(m.type==='list'){input=document.createElement('input');input.type='text';input.className='cfg-input';input.style.width='220px';input.value=(m.value||[]).join(', ')}
  else{input=document.createElement('input');input.type='number';input.className='cfg-input';input.value=m.value;if(m.step!=null)input.step=m.step;if(m.min!=null)input.min=m.min;if(m.max!=null)input.max=m.max}
- ctrl.appendChild(input);
+ configInputs[key]=input;ctrl.appendChild(input);
  const btn=document.createElement('button');btn.className='btn btn-sm btn-refresh';btn.textContent='💾';
  btn.onclick=()=>saveConfig(key,m,input);ctrl.appendChild(btn);return row}
-function saveConfig(key,m,input){let value;
- if(m.type==='bool')value=input.checked;
- else if(m.type==='list')value=input.value.split(',').map(s=>s.trim()).filter(Boolean);
- else value=parseFloat(input.value);
- fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[key]:value})})
- .then(r=>r.json()).then(res=>{if(res.ok){showToast('Сохранено',key+' = '+JSON.stringify(value),'info');if(res.restart_required&&res.restart_required.length)showToast('Нужен рестарт',res.restart_required.join(', '),'info')}else showToast('Ошибка',res.detail||'','loss')}).catch(()=>showToast('Ошибка','','loss'))}
+function filterConfig(){const q=$('config-search').value.toLowerCase();document.querySelectorAll('#config-groups .h-card').forEach(c=>{const k=c.dataset.key||'';c.style.display=(k.indexOf(q)>=0)?'':'none'})}
+function saveAllConfig(){const changes={};let restartReq=false;for(const[key,input]of Object.entries(configInputs)){const m=window.configCache[key];if(!m)continue;let value;
+ if(m.type==='bool')value=input.checked;else if(m.type==='list')value=input.value.split(',').map(s=>s.trim()).filter(Boolean);else value=parseFloat(input.value);
+ if(JSON.stringify(value)!==JSON.stringify(m.value)){changes[key]=value;if(m.restart)restartReq=true}}
+ if(Object.keys(changes).length===0){showToast('Нет изменений','','info');return}
+ fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)})
+ .then(r=>r.json()).then(res=>{if(res.ok){showToast('Сохранено',Object.keys(changes).length+' параметров','info');if(res.restart_required&&res.restart_required.length){$('restart-pending').style.display='inline';showToast('Нужен рестарт',res.restart_required.join(', '),'info')}}else showToast('Ошибка',res.detail||'','loss')}).catch(()=>showToast('Ошибка','','loss'))}
+function resetAllDefaults(){if(!confirm('Сбросить ВСЕ настройки к значениям по умолчанию?'))return;fetch('/api/config/reset',{method:'POST'}).then(r=>r.json()).then(res=>{if(res.ok){loadConfig();notify('♻️ Сброс','настройки сброшены','info')}else showToast('Ошибка',res.detail||'','loss')}).catch(()=>showToast('Ошибка','','loss'))}
 function downloadCSV(fn,text){const blob=new Blob(["\uFEFF"+text],{type:'text/csv;charset=utf-8;'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fn;a.click();URL.revokeObjectURL(a.href);notify('⬇️ Экспорт',fn,'info')}
 function exportTradesCSV(){if(!histCache||!histCache.length){alert('Нет данных');return}
  const L=['Время;Пара;Сторона;Цена входа;Цена выхода;Длит.(сек);Длительность;Маржа;Net PnL;Gross PnL;Причина;Тренд;Стена;Стратегия;MFE%;MAE%'];
