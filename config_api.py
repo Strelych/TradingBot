@@ -95,6 +95,8 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
 
 def _coerce(meta: Dict[str, Any], value: Any) -> Any:
     """Преобразует значение к типу, указанному в мета-описании."""
+    if value is None:
+        return None
     t = meta.get("type", "float")
     try:
         if t == "bool":
@@ -149,7 +151,7 @@ def _save() -> bool:
         cfg = _state["config"]
         if cfg is None:
             return False
-        data = {k: cfg.get(k) for k in CONFIG_META}
+        data = {k: cfg.get(k) for k in CONFIG_META if cfg.get(k) is not None}
         data["pair_overrides"] = cfg.get("pair_overrides", {})
         with open(_state["path"], "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
