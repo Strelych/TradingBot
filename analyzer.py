@@ -24,11 +24,11 @@ FEE_FLOOR_DEFAULT = 0.0016
 
 def recommend(reg):
     """Рекомендация режима с учётом fee-экономики (TASK PR1 4.1).
-    Returns (strategy, reason). Possible strategy values: TREND, WALL, SWING, FEE_NEGATIVE.
+    Returns (strategy, reason). Possible strategy values: TREND, WALL, SWING, OFF.
     - TREND: atr_pct >= fee_floor and trendiness >= 0.15
     - WALL: atr_pct >= fee_floor and wall_share >= 0.5 and trendiness < 0.15
     - SWING: atr_pct >= fee_floor and vol_rel < 0.7
-    - FEE_NEGATIVE: atr_pct < fee_floor (avoid trading; WALL only as canary)
+    - OFF: atr_pct < fee_floor (avoid trading)
     FLAT без стен не возвращает WALL по умолчанию.
     """
     fee_floor = reg.get("min_atr_pct_abs", FEE_FLOOR_DEFAULT)
@@ -50,8 +50,8 @@ def recommend(reg):
             return "TREND", "умеренная трендовость"
         return "SWING", "нейтрально — предпочитаем SWING"
     else:
-        # Fee-negative: atr below fee floor — avoid TREND; allow WALL only as canary
-        return "FEE_NEGATIVE", "ATR < fee_floor — избегать торгов (может использоваться канарейка WALL)"
+        # Fee-negative: atr below fee floor — avoid trading
+        return "OFF", "ATR < fee_floor — избегать торгов"
 
 def breakout_state(kl, max_range_pct):
     if not kl or len(kl)<30: return {"active":False,"side":None,"range_pct":0,"vol_ratio":0}
