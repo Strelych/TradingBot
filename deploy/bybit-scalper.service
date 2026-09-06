@@ -1,8 +1,8 @@
 [Unit]
-Description=Bybit Scalper v12
+Description=Bybit Scalper v12.7
 After=network.target
 [Service]
-WorkingDirectory=/root/bybit_scalper
+WorkingDirectory=/root/bybit_scaler
 ExecStart=/usr/bin/python3 server.py
 Restart=always
 RestartSec=3
