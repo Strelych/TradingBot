@@ -1,4 +1,4 @@
-# server.py - Bybit Scalper v11.1 (Adaptive Analytics + Readiness + Hot Pairs)
+# server.py - Bybit Scalper v12.6 (Adaptive Analytics + Readiness + Hot Pairs)
 import asyncio, json, time, sqlite3, os, math, traceback
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -11,6 +11,9 @@ from datetime import datetime
 from web_ui import WEB_PAGE
 import config_api, analyzer, adapter
 
+VERSION = "v12.7"
+BRANCH = "v12.7"
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger=logging.getLogger("BotServer")
 
@@ -18,16 +21,17 @@ CONFIG={
  "virtual_balance":500.0,"leverage":10,
  "symbols":["BTCUSDT","ETHUSDT","SOLUSDT","HUSDT","GRAMUSDT"],
  "pair_overrides":{},
- "margin_pct":0.05,"max_risk_pct":0.01,"max_notional":1000.0,"max_total_notional":1500.0,
+ "allowed_side":"BOTH","locked_strict":False,
+ "margin_pct":0.1,"max_risk_pct":0.01,"max_notional":1000.0,"max_total_notional":1500.0,
  "max_open_positions":3,"max_pending_orders":12,
  "max_daily_trades":0,"max_daily_commission":0.0,"daily_loss_halt_pct":0.0,
- "wall_volume_multiplier":8.0,"wall_min_age_seconds":60,"wall_persistence_check":5,
+ "wall_volume_multiplier":6.0,"wall_min_age_seconds":60,"wall_persistence_check":5,
  "limit_order_offset_pct":0.0001,"order_timeout_seconds":60,
  "sl_behind_wall_pct":0.002,"min_sl_distance_pct":0.003,
  "be_threshold_pct":0.003,"trail_activation_pct":0.006,"trail_atr_mult":1.5,"trail_min_pct":0.005,
  "tp_atr_mult":3.0,"min_tp_pct":0.008,"tp_round_number_preference":True,
  "grace_seconds":2.0,"time_stop_seconds":900,
- "trend_sl_atr_mult":1.5,"trend_trail_atr_mult":2.0,"imbalance_threshold":0.6,"imbalance_confirmation_ticks":3,
+ "trend_sl_atr_mult":1.5,"trend_trail_atr_mult":2.0,"imbalance_threshold":0.5,"imbalance_confirmation_ticks":3,
  "trend_tp_pct":0.006,"trend_tp_atr_mult":2.0,
  "swing_sl_atr_mult":2.5,"swing_tp_atr_mult":4.0,"swing_time_stop":86400,"swing_risk_mult":0.75,
  "grid_levels":4,"grid_step_pct":0.004,"grid_tp_mult":1.2,
@@ -37,23 +41,38 @@ CONFIG={
  "breakout_cooldown_seconds":7200,"breakout_time_stop":21600,
  "min_atr_pct_abs":0.0016,"trading_hours_blacklist":[],
  "max_spread_pct":0.0006,"atr_period":14,
- "require_trend_alignment":True,"mtf_timeframes":["5","15"],"mtf_min_confirms":2,
+ "trend_price_tolerance_pct":0.005,
+ "require_trend_alignment":True,"mtf_timeframes":["5","15"],"mtf_min_confirms":1,
+ "adapter_hysteresis_count":3,"canary_fraction":0.25,
  "loss_cooldown_seconds":60,"min_atr_rel":0.4,"max_atr_rel":4.0,
  "adaptive_enabled":True,"min_sample":20,"hysteresis":21600,
  "commission_maker":0.00036,"commission_taker":0.001,
  "ema_period":20,"update_interval":0.2,"data_stale_threshold":5,
  "ws_ping_interval":20,"ws_ping_timeout":10,"bybit_base_url":"https://api.bybit.com",
+ "autostart":True,
 }
 config_api.init_config_api(CONFIG)
 
 def get_param(symbol,key):
-    """Получение параметра с приоритетом: override пары -> глобальный CONFIG -> None"""
+    """Получение параметра с приоритетом: override пары -> глобальный CONFIG -> sensible default
+    Defaults are intentionally loose (allowed_side=BOTH, locked=False, risk_mult=1.0)
+    """
     overrides = CONFIG.get("pair_overrides") or {}
     pair_override = overrides.get(symbol) or {}
     # Сначала ищем в override пары, потом в глобальном CONFIG
     if key in pair_override:
         return pair_override[key]
-    return CONFIG.get(key)
+    # fall back to global CONFIG
+    if key in CONFIG:
+        return CONFIG.get(key)
+    # final sensible defaults
+    if key=="allowed_side":
+        return "BOTH"
+    if key=="locked":
+        return False
+    if key=="risk_mult":
+        return 1.0
+    return None
 def price_decimals(p):
     p=abs(p)
     if p>=1000:return 2
@@ -61,6 +80,44 @@ def price_decimals(p):
     if p>=1:return 4
     if p>=0.01:return 6
     return 8
+
+# --- Throttled logging for warnings (PR1 2.5)
+_last_log = {}
+
+def log_warn_throttle(symbol, reason_key, msg, interval=60):
+    """Log warning at most once per (symbol, reason_key) per interval seconds."""
+    now=time.time()
+    k=(symbol,reason_key)
+    last=_last_log.get(k,0)
+    if now-last>=interval:
+        logger.warning(msg)
+        _last_log[k]=now
+    else:
+        # optionally, keep a debug for suppressed logs
+        logger.debug(f"throttled warning {symbol} {reason_key} (suppressed)")
+
+# --- REST observability (BUG-1 PR1)
+_rest_state = {"fails": 0, "last_err": "", "ok": True}
+
+def rest_fail(msg):
+    _rest_state["fails"] += 1
+    _rest_state["last_err"] = msg[:80]
+    _rest_state["ok"] = False
+    log_warn_throttle("REST", "down", f"⚠️ REST down: {msg}", 60)
+
+async def fetch_json(url, params=None, ep="rest"):
+    if not state.http_session:
+        await init_http_session()
+    if not state.http_session:
+        rest_fail("no http session"); return None
+    try:
+        async with state.http_session.get(url, params=params) as r:
+            if r.status != 200:
+                rest_fail(f"HTTP {r.status} {ep}"); return None
+            _rest_state["ok"] = True; _rest_state["fails"] = 0
+            return await r.json()
+    except Exception as e:
+        rest_fail(f"{type(e).__name__}: {e} [{ep}]"); return None
 def round_price(p):return round(p,price_decimals(p))
 def round_grid(p):
     if p>=1000:return 100
@@ -164,17 +221,12 @@ def init_db():
 async def init_http_session():state.http_session=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
 async def close_http_session():
     if state.http_session:await state.http_session.close()
-async def fetch_json(url,params=None):
-    if not state.http_session:return None
-    try:
-        async with state.http_session.get(url,params=params) as r:
-            return await r.json() if r.status==200 else None
-    except Exception:return None
+# fetch_json moved up to line 108 with REST observability
 
 async def get_symbol_info(symbol):
     now=time.time()
     if symbol in state.sym_info and now-state.sym_info[symbol][0]<3600:return state.sym_info[symbol][1]
-    data=await fetch_json(f"{CONFIG['bybit_base_url']}/v5/market/instruments-info",{"category":"linear","symbol":symbol})
+    data=await fetch_json(f"{CONFIG['bybit_base_url']}/v5/market/instruments-info",{"category":"linear","symbol":symbol}, ep="info")
     info={}
     if data and data.get("result",{}).get("list"):
         it=data["result"]["list"][0]
@@ -192,7 +244,7 @@ async def get_klines(symbol,interval,limit=100):
     key=(symbol,interval);now=time.time()
     if key in state.kline_cache and now-state.kline_cache[key][0]<15:return state.kline_cache[key][1]
     data=await fetch_json(f"{CONFIG['bybit_base_url']}/v5/market/kline",
-        {"category":"linear","symbol":symbol,"interval":interval,"limit":limit})
+        {"category":"linear","symbol":symbol,"interval":interval,"limit":limit}, ep="kline")
     if not data or not data.get("result",{}).get("list"):return None
     kl=list(reversed(data["result"]["list"]))
     state.kline_cache[key]=(now,kl);return kl
@@ -227,6 +279,10 @@ async def refresh_sr(symbol):
 async def get_trend(symbol,interval):
     kl=await get_klines(symbol,interval,60)
     return ema_trend([float(k[4]) for k in kl]) if kl else "UNKNOWN"
+
+async def get_trend_ep(symbol,interval):
+    """Wrapper for trend endpoint with ep tagging"""
+    return await get_trend(symbol, interval)
 
 class WallTracker:
     def __init__(self):self.walls={s:{} for s in CONFIG["symbols"]}
@@ -288,6 +344,9 @@ class PaperTradingEngine:
         return net,gross,exit_commission
 paper_engine=PaperTradingEngine(CONFIG["virtual_balance"])
 
+from utils import compute_required_rm
+
+
 def compute_size(symbol,entry,sl_distance,rm):
     # Если rm=0 (канарейка OFF), возвращаем 0 - торговля заблокирована
     if rm==0 or entry==0:
@@ -301,7 +360,7 @@ def compute_size(symbol,entry,sl_distance,rm):
     if implied>max_risk and implied>0:qty*=max_risk/implied
     return qty
 
-# ===== HOT ADD/REMOVE PAIRS (v11) =====
+# ===== HOT ADD/REMOVE PAIRS (v12) =====
 async def apply_symbols(new_list):
     wanted=[x.strip() for x in dict.fromkeys(new_list) if isinstance(x,str) and x.strip()]
     keep=[x for x in list(state.orderbooks.keys()) if x not in wanted and
@@ -370,13 +429,33 @@ def shutdown_cleanup():
 async def lifespan(app):
     state.db_conn,state.db_cursor=init_db()
     await init_http_session()
+    
+    # BUG-1: Validate bybit_base_url on startup (PR1)
+    base_url = CONFIG.get("bybit_base_url") or ""
+    if not base_url.startswith("http"):
+        logger.warning(f"⚠️ bybit_base_url невалиден ({base_url!r}) — восстановлен дефолт")
+        CONFIG["bybit_base_url"] = "https://api.bybit.com"
+    
     state.start_time=time.time();state.load_stats()
     paper_engine.balance=state.stats["virtual_balance"]
+    
+    # BUG-4: Autostart trading (PR1)
+    if CONFIG.get("autostart", True):
+        state.is_trading = True
+        logger.info("▶️ автостарт торговли")
+    
     asyncio.create_task(bybit_ws_handler())
     state.analysis_task=asyncio.create_task(analysis_loop())
     adapter.adapter.start(state,CONFIG,get_param,config_api)
+    # Очистка спама auto-size из adaptive_log (TASK 2.9)
+    try:
+        adapter.adapter.kn_cur.execute("DELETE FROM adaptive_log WHERE reason LIKE 'auto-size%'")
+        adapter.adapter.kn_conn.commit()
+        logger.info("🧹 Очищен спам auto-size из adaptive_log")
+    except Exception as e:
+        logger.warning(f"Не удалось очистить спам adaptive_log: {e}")
     asyncio.create_task(housekeeping());asyncio.create_task(watchdog())
-    logger.info("✅ Bybit Scalper v11.1 запущен")
+    logger.info(f"✅ Bybit Scalper {VERSION} запущен")
     yield
     shutdown_cleanup()
     state.save_stats();await close_http_session()
@@ -393,6 +472,8 @@ async def housekeeping():
                     if k=="pair_overrides":CONFIG["pair_overrides"]=v
                     elif k=="symbols":pass
                     elif k in config_api.CONFIG_META:CONFIG[k]=config_api._coerce(config_api.CONFIG_META[k],v)
+                if not (CONFIG.get("bybit_base_url") or "").startswith("http"):
+                    CONFIG["bybit_base_url"]="https://api.bybit.com"
                 if "symbols" in ov and list(ov["symbols"])!=old_syms:
                     await apply_symbols(ov["symbols"])
         except Exception:pass
@@ -414,7 +495,7 @@ async def watchdog():
             state.analysis_task=asyncio.create_task(analysis_loop())
             state.last_tick=time.time()
 
-app=FastAPI(title="Bybit Scalper v11.1",lifespan=lifespan)
+app=FastAPI(title=f"Bybit Scalper {VERSION}",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
 app.include_router(config_api.router)
 @app.get("/",response_class=HTMLResponse)
@@ -470,11 +551,21 @@ async def api_reset():
 async def api_pairs():
     out={}
     for s in CONFIG["symbols"]:
+        sr=state.support_resistance.get(s,{})
         reg=analyzer.regime(state,s)
         rec,reason=analyzer.recommend(reg)
+        ov=CONFIG.get("pair_overrides",{}).get(s,{})
+        base_rm=ov.get("risk_mult") or 1.0
+        canary_val=adapter.adapter.canary.get(s)
+        eff_rm=base_rm*(canary_val if canary_val is not None else 1.0)
+        # fee_positive: True если ATR > fee_floor (пара может торговаться в плюс)
+        fee_floor=CONFIG.get("min_atr_pct_abs",0.0016)
+        atr_pct=sr.get("atr_pct",0)
+        fee_positive=atr_pct>=fee_floor
         out[s]={"set":get_param(s,"strategy") or "AUTO","active":state.recommended.get(s,rec),"rec":rec,
                 "rec_reason":state.rec_reason.get(s,reason),"regime":reg,
-                "overrides":CONFIG.get("pair_overrides",{}).get(s,{})}
+                "overrides":ov,"eff_risk":eff_rm,"fee_positive":fee_positive,
+                "atr":sr.get("atr",0),"atr_pct":atr_pct}
     return out
 
 @app.post("/api/pairs/{symbol}")
@@ -486,9 +577,46 @@ async def api_pair_set(symbol:str,payload:dict):
     logger.info(f"🎛️ {symbol} override: {payload}")
     return{"ok":True}
 
+@app.post("/api/adapter/mode/{symbol}")
+async def api_adapter_mode(symbol:str, mode:str):
+    ov=CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
+    ov["adapter_mode"]=mode
+    config_api._save()
+    logger.info(f"🎛️ {symbol} adapter_mode: {mode}")
+    return{"ok":True}
+
 @app.get("/api/adapter")
 async def api_adapter():
     return adapter.adapter.public_state()
+
+@app.get("/api/diag")
+async def api_diag():
+    """Авто-диагностика: причина простоя для каждой пары."""
+    diag = []
+    for symbol in CONFIG["symbols"]:
+        reg = analyzer.regime(state, symbol)
+        ov = CONFIG.get("pair_overrides",{}).get(symbol,{})
+        lr = adapter.adapter.read_regime(symbol)
+        
+        # Определяем причину простоя
+        reason = "торгуется"
+        strat = ov.get("adapter_strategy") or ov.get("strategy")
+        if strat == "OFF":
+            reason = "OFF (адаптер)" if ov.get("adapter_strategy") == "OFF" else "OFF (ручной)"
+        elif lr[3] < 0.0008:
+            reason = f"fee-negative (ATR {lr[3]*100:.3f}% < 0.08%)"
+        elif reg["wall_share"] < 0.3 and strat == "WALL":
+            reason = "нет стен (wall_share < 0.3)"
+        
+        diag.append({
+            "symbol": symbol,
+            "strategy": strat,
+            "risk_mult": ov.get("risk_mult", 0),
+            "atr_pct": lr[3],
+            "wall_share": reg["wall_share"],
+            "reason": reason
+        })
+    return {"diag": diag, "timestamp": time.time()}
 
 @app.get("/api/analytics")
 async def api_analytics():
@@ -497,12 +625,14 @@ async def api_analytics():
         rows=analyzer.get_rows(state.db_conn,s,72)
         m=analyzer.trade_metrics(rows)
         perf=analyzer.perf_by_strategy(rows)
+        scores=analyzer.strategy_scores(rows)
         hours=analyzer.hour_stats(rows)
         reg=analyzer.regime(state,s)
         rec,reason=analyzer.recommend(reg)
         kl15=await get_klines(s,"15",60)
         bo=analyzer.breakout_state(kl15,get_param(s,"breakout_max_range_pct")) if kl15 else {"active":False}
-        pairs[s]={"metrics":m,"perf":perf,"hours":hours,"regime":reg,"recommendation":rec,"rec_reason":reason,
+        qs=analyzer.quality_score(rows) if len(rows)>=5 else 0.0
+        pairs[s]={"metrics":m,"perf":perf,"scores":scores,"quality_score":qs,"hours":hours,"regime":reg,"recommendation":rec,"rec_reason":reason,
                   "breakout":bo,"progress":min(100,int(100*m.get("n",0)/max(1,get_param(s,"min_sample")))),
                   "set":get_param(s,"strategy") or "AUTO","active_strat":state.recommended.get(s,rec)}
     cur=state.db_cursor
@@ -567,16 +697,26 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         state.imbalance_counters[symbol]=state.imbalance_counters.get(symbol,0)-1
         if state.imbalance_counters[symbol]<=-get_param(symbol,"imbalance_confirmation_ticks"):need_side="Sell"
     else:state.imbalance_counters[symbol]=0
-    if not need_side:return out
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=need_side:return out
+    if not need_side:
+        log_warn_throttle(symbol, "no_imbalance", f"⚠️ {symbol} entry_wall skipped: no imbalance/need_side")
+        return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=need_side:
+        log_warn_throttle(symbol, "side_not_allowed", f"⚠️ {symbol} entry_wall skipped: side not allowed (need {need_side})")
+        return out
     if CONFIG["require_trend_alignment"]:
         need="BULLISH" if need_side=="Buy" else "BEARISH"
-        if trend1!=need or sum(1 for tf in mtf.values() if tf==need)<get_param(symbol,"mtf_min_confirms"):return out
+        if trend1!=need or sum(1 for tf in mtf.values() if tf==need)<get_param(symbol,"mtf_min_confirms"):
+            log_warn_throttle(symbol, "trend_not_aligned", f"⚠️ {symbol} entry_wall skipped: trend not aligned (need {need})")
+            return out
     walls=[w for w in wall_tracker.valid(symbol) if w["side"]==("bid" if need_side=="Buy" else "ask")]
-    if not walls:return out
+    if not walls:
+        log_warn_throttle(symbol, "no_walls", f"⚠️ {symbol} entry_wall skipped: no walls")
+        return out
     wall=min(walls,key=lambda w:abs(w["price"]-mid))
     fp=best_ask if need_side=="Buy" else best_bid
-    if abs(fp-mid)/mid>0.001:return out
+    if abs(fp-mid)/mid>0.001:
+        log_warn_throttle(symbol, "price_far_from_mid", f"⚠️ {symbol} entry_wall skipped: price far from mid (fp={fp} mid={mid})")
+        return out
     entry=round_tick(wall["price"]*(1+CONFIG["limit_order_offset_pct"]) if need_side=="Buy" else wall["price"]*(1-CONFIG["limit_order_offset_pct"]),sinfo)
     wall_sl=wall["price"]*(1-get_param(symbol,"sl_behind_wall_pct")) if need_side=="Buy" else wall["price"]*(1+get_param(symbol,"sl_behind_wall_pct"))
     floor=entry*(1-get_param(symbol,"min_sl_distance_pct")) if need_side=="Buy" else entry*(1+get_param(symbol,"min_sl_distance_pct"))
@@ -588,9 +728,13 @@ async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr
         r=tp_to_round(tp,need_side)
         if (need_side=="Buy" and r>entry) or (need_side=="Sell" and r<entry):tp=r
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"WALL")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):
+        log_warn_throttle(symbol, "qty_below_min", f"⚠️ {symbol} entry_wall skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return out
     order=paper_engine.place_limit_order(symbol,need_side,qty,entry)
-    if not order:return out
+    if not order:
+        log_warn_throttle(symbol, "order_failed", f"⚠️ {symbol} entry_wall skipped: order placement failed")
+        return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,need_side,entry,qty,
         f"Bounce от {wall['side']}-стены @ {round_price(wall['price'])}",order["margin"],order["commission"],
@@ -603,13 +747,23 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     side=None
     if trend1=="BULLISH" and sum(1 for v in mtf.values() if v=="BULLISH")>=get_param(symbol,"mtf_min_confirms") and imbalance>-0.2:side="Buy"
     elif trend1=="BEARISH" and sum(1 for v in mtf.values() if v=="BEARISH")>=get_param(symbol,"mtf_min_confirms") and imbalance<0.2:side="Sell"
-    if not side:return out
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return out
+    if not side:
+        log_warn_throttle(symbol, "no_side_trend", f"⚠️ {symbol} entry_trend skipped: no side (trend/mtf/imbalance)")
+        return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
+        log_warn_throttle(symbol, "side_not_allowed_trend", f"⚠️ {symbol} entry_trend skipped: side not allowed (need {side})")
+        return out
     closes=sr.get("closes",[])
     mid=(best_bid+best_ask)/2
     if closes:
-        if side=="Buy" and mid<max(closes[-20:])*0.999:return out
-        if side=="Sell" and mid>min(closes[-20:])*1.001:return out
+        tol = get_param(symbol,"trend_price_tolerance_pct") or 0.005
+        # Allow some leeway from recent highs/lows using configurable tolerance
+        if side=="Buy" and mid<max(closes[-20:])*(1-tol):
+            log_warn_throttle(symbol, "price_below_highs", f"⚠️ {symbol} entry_trend skipped: price below recent highs")
+            return out
+        if side=="Sell" and mid>min(closes[-20:])*(1+tol):
+            log_warn_throttle(symbol, "price_above_lows", f"⚠️ {symbol} entry_trend skipped: price above recent lows")
+            return out
     entry=round_tick(best_ask if side=="Buy" else best_bid,sinfo)
     sl_dist=atr*get_param(symbol,"trend_sl_atr_mult") if atr>0 else entry*0.005
     sl=entry-sl_dist if side=="Buy" else entry+sl_dist
@@ -617,9 +771,13 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"TREND")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):
+        log_warn_throttle(symbol, "qty_below_min_trend", f"⚠️ {symbol} entry_trend skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
-    if not order:return out
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_trend skipped: order placement failed")
+        return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,side,entry,qty,f"Trend {trend1} + MTF",
         order["margin"],order["commission"],order["notional"],round_price(sl),tp,"TREND"))
@@ -629,7 +787,9 @@ async def entry_trend(symbol,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo
 async def entry_swing(symbol,mid,sinfo):
     out=[]
     kl=await get_klines(symbol,"60",60)
-    if not kl:return out
+    if not kl:
+        log_warn_throttle(symbol, "no_klines_60", f"⚠️ {symbol} entry_swing skipped: no klines 60")
+        return out
     t60=ema_trend([float(k[4]) for k in kl])
     atr1h=calc_atr(kl,CONFIG["atr_period"])
     sup=min(float(k[3]) for k in kl[-50:]);res=max(float(k[2]) for k in kl[-50:])
@@ -638,13 +798,21 @@ async def entry_swing(symbol,mid,sinfo):
         side="Buy";entry=sup*(1+0.0002);sl=entry-atr1h*get_param(symbol,"swing_sl_atr_mult");tp=entry+atr1h*get_param(symbol,"swing_tp_atr_mult")
     elif t60=="BEARISH" and mid>=res*(1-0.5*atr1h/res):
         side="Sell";entry=res*(1-0.0002);sl=entry+atr1h*get_param(symbol,"swing_sl_atr_mult");tp=entry-atr1h*get_param(symbol,"swing_tp_atr_mult")
-    if not side:return out
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return out
+    if not side:
+        log_warn_throttle(symbol, "no_side_swing", f"⚠️ {symbol} entry_swing skipped: no side (1h trend/zone)")
+        return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
+        log_warn_throttle(symbol, "side_not_allowed_swing", f"⚠️ {symbol} entry_swing skipped: side not allowed (need {side})")
+        return out
     entry=round_tick(entry,sinfo);sl_dist=abs(entry-sl)
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"SWING")*get_param(symbol,"swing_risk_mult")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return out
+    if not qty or qty<sinfo.get("min_qty",0):
+        log_warn_throttle(symbol, "qty_below_min_swing", f"⚠️ {symbol} entry_swing skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return out
     order=paper_engine.place_limit_order(symbol,side,qty,entry)
-    if not order:return out
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_swing skipped: order placement failed")
+        return out
     state.daily_commission+=order["commission"]
     out.append(PendingOrder(state.pending_id,symbol,side,entry,qty,f"Swing 1h {t60} от зоны",
         order["margin"],order["commission"],order["notional"],round_price(sl),round_price(tp),"SWING",
@@ -654,11 +822,15 @@ async def entry_swing(symbol,mid,sinfo):
 
 async def entry_grid(symbol,mid,sinfo):
     out=[]
-    if get_param(symbol,"allowed_side") not in (None,"BOTH","Buy"):return out
+    if get_param(symbol,"allowed_side") not in (None,"BOTH","Buy"):
+        log_warn_throttle(symbol, "buy_not_allowed_grid", f"⚠️ {symbol} entry_grid skipped: Buy not allowed")
+        return out
     levels=get_param(symbol,"grid_levels");step=get_param(symbol,"grid_step_pct")
     open_grid=sum(1 for p in state.open_positions.values() if p["strategy"]=="GRID")
     pend_grid=sum(1 for po in state.pending_orders if po.strategy=="GRID")
-    if open_grid+pend_grid>=levels:return out
+    if open_grid+pend_grid>=levels:
+        log_warn_throttle(symbol, "grid_levels_exhausted", f"⚠️ {symbol} entry_grid skipped: grid levels exhausted ({open_grid+pend_grid}/{levels})")
+        return out
     for i in range(1,levels+1):
         price=round_tick(mid*(1-i*step),sinfo)
         if any(abs(po.price-price)<price*0.0005 for po in state.pending_orders):continue
@@ -669,7 +841,7 @@ async def entry_grid(symbol,mid,sinfo):
         if not qty or qty<sinfo.get("min_qty",0):continue
         order=paper_engine.place_limit_order(symbol,"Buy",qty,price)
         if not order:
-            logger.warning(f"⚠️ GRID {symbol}: не хватает средств на уровень {i}")
+            log_warn_throttle(symbol, "grid_no_funds", f"⚠️ GRID {symbol}: не хватает средств на уровень {i}")
             continue
         state.daily_commission+=order["commission"]
         tp=price*(1+step*get_param(symbol,"grid_tp_mult"))
@@ -680,9 +852,13 @@ async def entry_grid(symbol,mid,sinfo):
     return out
 
 async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
-    if not bo.get("active"):return None
+    if not bo.get("active"):
+        log_warn_throttle(symbol, "no_bo_active", f"⚠️ {symbol} entry_breakout skipped: no breakout active")
+        return None
     side=bo["side"]
-    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:return None
+    if get_param(symbol,"allowed_side") not in (None,"BOTH") and get_param(symbol,"allowed_side")!=side:
+        log_warn_throttle(symbol, "side_not_allowed_breakout", f"⚠️ {symbol} entry_breakout skipped: side not allowed (need {side})")
+        return None
     entry=best_ask if side=="Buy" else best_bid
     sl_dist=max(atr*get_param(symbol,"breakout_sl_atr_mult"),entry*0.006) if atr>0 else entry*0.01
     sl=entry-sl_dist if side=="Buy" else entry+sl_dist
@@ -690,9 +866,13 @@ async def entry_breakout(symbol,bo,best_bid,best_ask,atr,sinfo):
     tp_pct=max(get_param(symbol,"trend_tp_pct"),get_param(symbol,"trend_tp_atr_mult")*atr_pct)*2
     tp=round_price(entry*(1+tp_pct)) if side=="Buy" else round_price(entry*(1-tp_pct))
     qty=round_qty(compute_size(symbol,entry,sl_dist,eff_risk_mult(symbol,"BREAKOUT")),sinfo)
-    if not qty or qty<sinfo.get("min_qty",0):return None
+    if not qty or qty<sinfo.get("min_qty",0):
+        log_warn_throttle(symbol, "qty_below_min_breakout", f"⚠️ {symbol} entry_breakout skipped: qty {qty} < min_qty {sinfo.get('min_qty',0)}")
+        return None
     order=paper_engine.place_market_order(symbol,side,qty,entry)
-    if not order:return None
+    if not order:
+        logger.warning(f"⚠️ {symbol} entry_breakout skipped: market order failed")
+        return None
     state.daily_commission+=order["commission"]
     return {"side":side,"entry":entry,"qty":qty,"order":order,"sl":round_price(sl),"tp":tp,
             "time_stop":get_param(symbol,"breakout_time_stop"),
@@ -777,10 +957,32 @@ async def analysis_loop():
                         state.recommended[symbol]=rec;state.rec_reason[symbol]=reason
                     setv=get_param(symbol,"strategy") or "AUTO"
                     if setv=="AUTO":
-                        active=get_param(symbol,"adapter_strategy") or state.recommended.get(symbol,rec)
-                    else:active=setv
-                    if setv=="AUTO" and bo.get("active"):active="BREAKOUT"
+                        # If adapter override exists use it; else use analyzer recommendation
+                        active_override = get_param(symbol,"adapter_strategy")
+                        if active_override:
+                            active = active_override
+                        else:
+                            active = state.recommended.get(symbol,rec)
+                    else:
+                        active=setv
+                    if setv=="AUTO" and bo.get("active"):
+                        active="BREAKOUT"
                     sinfo=await get_symbol_info(symbol)
+                    # Оценка ожидаемого размера позиции для readiness (calc_qty)
+                    calc_qty=0
+                    skip_size=False
+                    if active not in ("OFF",) and mid>0 and sinfo:
+                        sl_dist=mid*0.01
+                        rm=eff_risk_mult(symbol,active)
+                        raw_qty=compute_size(symbol,mid,sl_dist,rm)
+                        calc_qty=round_qty(raw_qty,sinfo)
+                        # Если qty меньше min_qty — попытаться временно поднять risk_mult, если пара не locked
+                        min_qty = sinfo.get("min_qty",0)
+                        if calc_qty < min_qty:
+                            # Size-bump перенесён в adapter.eval (TASK 2.1)
+                            # Здесь только флаг skip_size для readiness
+                            log_warn_throttle(symbol, "skip_size", f"⚠️ {symbol} skip_size: qty {calc_qty} < min_qty {min_qty}; требуется size-bump в адаптере")
+                            skip_size=True
                     signal="HOLD"
                     in_cool=now<state.cooldown_until.get(symbol,0)
                     hour_ok=datetime.now().hour not in (get_param(symbol,"trading_hours_blacklist") or [])
@@ -797,6 +999,7 @@ async def analysis_loop():
                     ck("спред",spread_pct<=CONFIG["max_spread_pct"]);ck("кулдаун",not in_cool)
                     ck("лимиты",entry_allowed(symbol));ck("час",hour_ok)
                     ck("слоты",len(state.open_positions)<CONFIG["max_open_positions"] and len(state.pending_orders)<CONFIG["max_pending_orders"])
+                    ck("размер", calc_qty>=(sinfo.get("min_qty",0) if sinfo else 0))
                     miss=None
                     if not state.is_trading:miss="торговля выключена"
                     elif is_stale:miss="стакан устарел"
@@ -804,7 +1007,11 @@ async def analysis_loop():
                     elif not hour_ok:miss="час в блэклисте"
                     elif not entry_allowed(symbol):miss="лимиты дня/экспозиции"
                     elif spread_pct>CONFIG["max_spread_pct"]:miss="широкий спред"
-                    elif not(len(state.open_positions)<CONFIG["max_open_positions"] and len(state.pending_orders)<CONFIG["max_pending_orders"]):miss="нет слотов"
+                    if not(len(state.open_positions)<CONFIG["max_open_positions"] and len(state.pending_orders)<CONFIG["max_pending_orders"]):
+                        miss="нет слотов"
+                    # Логируем причину блокировки gate для диагностики
+                    if not gate:
+                        logger.debug(f"{symbol} gate blocked: {miss}")
                     else:
                         if active=="WALL":
                             ck("волатильность",vol_ok)
@@ -987,7 +1194,20 @@ async def websocket_endpoint(websocket:WebSocket):
 @app.get("/api/status")
 async def get_status():
     return{"is_trading":state.is_trading,"symbols":CONFIG["symbols"],"ws_connected":state.ws_connected,
-           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors}}
+           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors,
+           "rest_ok":_rest_state["ok"],"rest_fails":_rest_state["fails"],"rest_last_error":_rest_state["last_err"]},
+           "version":VERSION}
+
+@app.get("/api/version")
+async def get_version():
+    cv = 0
+    try:
+        adapter.adapter.kn_cur.execute("SELECT MAX(version) FROM config_versions")
+        r = adapter.adapter.kn_cur.fetchone()
+        cv = r[0] if r and r[0] is not None else 0
+    except Exception:
+        cv = 0
+    return {"version": VERSION, "config_version": cv, "branch": BRANCH}
 
 @app.get("/api/trades")
 async def get_trades(limit:int=1000):

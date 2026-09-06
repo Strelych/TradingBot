@@ -1,4 +1,4 @@
-# analyzer.py - аналитический движок (v11)
+# analyzer.py - аналитический движок (v12)
 import time, statistics
 from datetime import datetime
 
@@ -18,11 +18,40 @@ def regime(state, symbol):
     return {"vol_rel":round(vol_rel,2),"trendiness":round(trendiness(sr.get("closes",[])),3),
             "wall_share":round(wt/tot,2) if tot>0 else 0.0,"atr_pct":round(atr_pct,5)}
 
+# Default fee floor (min_atr_pct_abs). analyzer.recommend uses this to avoid suggesting strategies
+# that aren't fee-positive on low-ATR pairs.
+FEE_FLOOR_DEFAULT = 0.0016
+
 def recommend(reg):
-    if reg["trendiness"]>0.25 and reg["vol_rel"]>1.2: return "TREND","трендовость+волатильность"
-    if reg["wall_share"]>0.5 and 0.7<=reg["vol_rel"]<=1.5 and reg["trendiness"]<=0.25: return "WALL","боковик со стенами"
-    if reg["vol_rel"]<0.7 and reg["trendiness"]<=0.2: return "SWING","низкая волатильность"
-    return "WALL","базовый режим"
+    """Рекомендация режима с учётом fee-экономики (TASK PR1 4.1).
+    Returns (strategy, reason). Possible strategy values: TREND, WALL, SWING, OFF.
+    - TREND: atr_pct >= fee_floor and trendiness >= 0.15
+    - WALL: atr_pct >= fee_floor and wall_share >= 0.5 and trendiness < 0.15
+    - SWING: atr_pct >= fee_floor and vol_rel < 0.7
+    - OFF: atr_pct < fee_floor (avoid trading)
+    FLAT без стен не возвращает WALL по умолчанию.
+    """
+    fee_floor = reg.get("min_atr_pct_abs", FEE_FLOOR_DEFAULT)
+    atr_pct = reg.get("atr_pct", 0.0)
+    trendiness_v = reg.get("trendiness", 0.0)
+    vol_rel = reg.get("vol_rel", 1.0)
+    wall_share = reg.get("wall_share", 0.0)
+
+    # Fee-positive pairs
+    if atr_pct >= fee_floor:
+        if trendiness_v >= 0.15:
+            return "TREND", "волатильна, есть трендовость"
+        if wall_share >= 0.5 and trendiness_v < 0.15:
+            return "WALL", "боковик со стенами"
+        if vol_rel < 0.7:
+            return "SWING", "низкая волатильность"
+        # Otherwise prefer TREND if any mild trend, else SWING as safer default
+        if trendiness_v >= 0.10:
+            return "TREND", "умеренная трендовость"
+        return "SWING", "нейтрально — предпочитаем SWING"
+    else:
+        # Fee-negative: atr below fee floor — avoid trading
+        return "OFF", "ATR < fee_floor — избегать торгов"
 
 def breakout_state(kl, max_range_pct):
     if not kl or len(kl)<30: return {"active":False,"side":None,"range_pct":0,"vol_ratio":0}
@@ -67,15 +96,21 @@ def halves(rows):
     return trade_metrics(rows[:mid]), trade_metrics(rows[mid:])
 
 def perf_by_strategy(rows):
+    """Группировка метрик по exit_reason (STOP_LOSS, TAKE_PROFIT и т.д.)."""
     d={}
-    for r in rows: d.setdefault(r[8] or "?",[]).append(r)
+    for r in rows:
+        key = r[2] or "?"  # exit_reason - ключ для перформанса по причинам выхода
+        d.setdefault(key, []).append(r)
     return {s:trade_metrics(rs) for s,rs in d.items()}
 
 def strategy_scores(rows, min_n=3):
     out={}
     for s,pm in perf_by_strategy(rows).items():
         if pm["n"]==0: continue
-        out[s]={"n":pm["n"],"net":pm["net"],"net_per_trade":round(pm["net"]/pm["n"],4)}
+        net_list = [r[0] for r in rows if r[8] == s]
+        std = statistics.stdev(net_list) if len(net_list) > 1 else 1.0
+        sharpe = pm["net"] / std if std > 0 else pm["net"]
+        out[s]={"n":pm["n"],"net":pm["net"],"net_per_trade":round(pm["net"]/pm["n"],4),"sharpe":round(sharpe,3)}
     return out
 
 def hour_stats(rows, worst=3):
@@ -87,30 +122,141 @@ def hour_stats(rows, worst=3):
     lst.sort(key=lambda x:x["net"])
     return lst[:worst]
 
-def decide_strategy(scores, reg, bo, current, stale, min_n=3, off_floor=-0.03):
-    if bo.get("active"): return "BREAKOUT",1.0,"активный пробой диапазона"
-    elig={s:m for s,m in scores.items() if m["n"]>=min_n}
-    prof={s:m for s,m in elig.items() if m["net_per_trade"]>0}
-    if prof:
-        s,b=max(prof.items(),key=lambda kv:kv[1]["net_per_trade"])
-        return s,(1.0 if b["n"]>=10 else 0.5),f"лучший net/сделку {b['net_per_trade']:+.3f} (n={b['n']})"
-    if elig:
-        s,b=max(elig.items(),key=lambda kv:kv[1]["net_per_trade"])
-        if b["net_per_trade"]>=off_floor:
-            return s,0.25,f"пограничный net/сделку {b['net_per_trade']:+.3f} — канарейка ×0.25"
-        if current=="OFF" and stale: return recommend(reg)[0],0.25,"ре-разведка после OFF"
-        return "OFF",0.0,f"все стратегии убыточны (лучший {b['net_per_trade']:+.3f})"
-    return recommend(reg)[0],0.5,"мало данных: режимная канарейка ×0.5"
+def quality_score(rows):
+    """Оценка качества сделок: комбинация WR, MFE/MAE ratio, commissions/gross."""
+    if len(rows) < 5:
+        return 0.0
+    
+    m = trade_metrics(rows)
+    wr = m["wr"] / 100.0  # 0..1
+    fees_ratio = m["fees"] / m["gross"] if m["gross"] > 0 else 1.0  # 0..1 (меньше = лучше)
+    
+    # Средний MFE/MAE ratio
+    mfe_list = [r[6] for r in rows if r[6] is not None and r[6] > 0]
+    mae_list = [abs(r[7]) for r in rows if r[7] is not None and r[7] < 0]
+    if mfe_list and mae_list:
+        avg_mfe = statistics.mean(mfe_list)
+        avg_mae = statistics.mean(mae_list)
+        capture_ratio = avg_mfe / (avg_mfe + avg_mae) if (avg_mfe + avg_mae) > 0 else 0.5
+    else:
+        capture_ratio = 0.5
+    
+    # Quality Score = WR * (1 - fees_ratio) * capture_ratio
+    # Идеал: WR=1.0, fees_ratio=0.0, capture_ratio=1.0 → Score=1.0
+    score = wr * (1.0 - min(1.0, fees_ratio)) * capture_ratio
+    return round(score, 3)
 
-def adaptive_rules(m, h1, h2, get, symbol):
+def decide_strategy(scores, reg, bo, current, stale, m=None, h1=None, h2=None, min_sample=20, min_n=3, off_floor=-0.03):
+    """Decide strategy with cold-start and split-validation (TASK PR1 4.2).
+    - If bo active -> BREAKOUT
+    - If total trades < min_sample -> never OFF and never risk_mult=0; return recommend() with canary 0.5
+    - OFF only when BOTH halves (h1 & h2) have net_per_trade < off_floor
+    - borderline (>= off_floor) -> canary x0.25
+    - profitable -> x0.5 or x1.0 when n>=10
+    """
+    if bo.get("active"):
+        return "BREAKOUT", 1.0, "активный пробой диапазона"
+
+    # total trades across strategies
+    total_n = 0
+    try:
+        total_n = sum(int(v.get("n", 0)) for v in scores.values())
+    except Exception:
+        total_n = 0
+
+    # Cold start: if not enough history, do not return OFF or risk=0
+    if m is None:
+        m_n = total_n
+    else:
+        m_n = int(m.get("n", total_n))
+
+    if m_n < min_sample:
+        rec, reason = recommend(reg)
+        # If fee-negative, still return what recommend suggests, but canary should be conservative
+        rm = 0.5
+        return rec, rm, f"мало данных (n={m_n} < {min_sample}): режимная канарейка ×0.5 | {reason}"
+
+    # Split-validation for OFF
+    both_bad = False
+    if h1 is not None and h2 is not None:
+        try:
+            both_bad = (h1.get("net_per_trade", 0) < off_floor) and (h2.get("net_per_trade", 0) < off_floor)
+        except Exception:
+            both_bad = False
+
+    elig = {s: m for s, m in scores.items() if m.get("n", 0) >= min_n}
+    prof = {s: m for s, m in elig.items() if m.get("net_per_trade", 0) > 0}
+
+    if prof:
+        # Use Sharpe ratio if available, otherwise net_per_trade
+        s, b = max(prof.items(), key=lambda kv: kv[1].get("sharpe", kv[1]["net_per_trade"]))
+        return s, (1.0 if b.get("n", 0) >= 10 else 0.5), f"лучший Sharpe {b.get('sharpe',0):+.2f} (n={b['n']})"
+
+    if elig:
+        s, b = max(elig.items(), key=lambda kv: kv[1].get("sharpe", kv[1]["net_per_trade"]))
+        if b.get("net_per_trade", 0) >= off_floor:
+            return s, 0.25, f"пограничный net/сделку {b['net_per_trade']:+.3f} — канарейка ×0.25"
+        # If both halves are bad -> OFF with honest 0 risk
+        if both_bad:
+            return "OFF", 0.0, f"split-валидация: обе половины хуже {off_floor:+.3f} -> OFF"
+        # If current is OFF and stale, try re-reconnaissance
+        if current == "OFF" and stale:
+            rec, reason = recommend(reg)
+            return rec, 0.25, f"ре-разведка после OFF: {reason}"
+        return "OFF", 0.0, f"все стратегии убыточны (лучший {b['net_per_trade']:+.3f})"
+
+    # No eligible strategies -> fall back to recommend (fee-aware)
+    rec, reason = recommend(reg)
+    return rec, 0.5, f"мало данных / нет eligible: режимная канарейка ×0.5 | {reason}"
+
+def adaptive_rules(m, h1, h2, get, symbol, perf=None):
+    """Адаптивные правила выходов (TASK v13 PR1).
+    
+    Правила:
+    1) SL никогда не win при >=5 попыток -> расширить стоп TREND
+    2) MFE≈0 на убытках + WR<30 -> входы мёртвые: ужесточить подтверждение
+    3) gross>0, net<=0 -> комиссии съедают: поднять порог трейлинга
+    4) trailing gross>0 net<=0 -> дать прибыли дышать
+    5) TIME_STOP в минус -> сократить время мёртвых сделок
+    """
     out=[]
-    if m.get("n",0)<get(symbol,"min_sample"): return out
-    both=lambda f:(h1 is not None and h2 is not None and f(h1) and f(h2)) or (h1 is None and f(m))
-    if both(lambda x:x.get("inst_stop",0)>0.35):
-        out.append(("wall_min_age_seconds",min(120,get(symbol,"wall_min_age_seconds")+15),"мгновенные стопы>35% (обе половины)"))
-        out.append(("min_sl_distance_pct",min(0.02,get(symbol,"min_sl_distance_pct")*1.15),"мгновенные стопы>35%"))
-    if m.get("avg_mfe",0)>0.008:
-        out.append(("trail_atr_mult",min(6.0,get(symbol,"trail_atr_mult")*1.15),"MFE высокий — дать прибыли дышать"))
-    if m.get("avg_mae",0)>-0.002 and m.get("inst_stop",0)>0.3:
-        out.append(("min_sl_distance_pct",min(0.02,get(symbol,"min_sl_distance_pct")*1.15),"MAE мал — стопы слишком близко"))
+    n = m.get("n", 0)
+    if n < 10: 
+        return out  # гейт ниже для выходов (было 20)
+    
+    perf = perf or {}
+    sl = perf.get("STOP_LOSS")
+    tr = perf.get("TRAILING_STOP")
+    ts = perf.get("TIME_STOP")
+    
+    # 1) SL никогда не win при >=5 попыток -> расширить стоп TREND
+    if sl and sl["n"] >= 5 and sl["wr"] == 0:
+        out.append(("trend_sl_atr_mult",
+                    min(4.0, get(symbol, "trend_sl_atr_mult") * 1.25),
+                    f"SL 0/{sl['n']} побед — расширить стоп TREND"))
+    
+    # 2) MFE≈0 на убытках + WR<30 -> входы мёртвые: ужесточить подтверждение
+    if m.get("avg_mfe", 0) < 0.003 and m.get("wr", 0) < 30:
+        out.append(("imbalance_confirmation_ticks",
+                    min(10, get(symbol, "imbalance_confirmation_ticks") + 2),
+                    "MFE≈0 на убытках — ужесточить подтверждение входа"))
+    
+    # 3) gross>0, net<=0 -> комиссии съедают: поднять порог трейлинга
+    if m.get("gross", 0) > 0 and m.get("net", 0) <= 0:
+        out.append(("trail_activation_pct",
+                    min(0.02, get(symbol, "trail_activation_pct") * 1.3),
+                    "gross>0 net<=0 — трейлинг отдаёт комиссии"))
+    
+    # 4) trailing gross>0 net<=0 -> дать прибыли дышать
+    if tr and tr["n"] >= 3 and tr["gross"] > 0 and tr["net"] <= 0:
+        out.append(("trend_trail_atr_mult",
+                    min(6.0, get(symbol, "trend_trail_atr_mult") * 1.2),
+                    "trailing gross>0 net<=0 — дать прибыли дышать"))
+    
+    # 5) TIME_STOP в минус -> сократить время мёртвых сделок
+    if ts and ts["n"] >= 2 and ts["net"] < 0:
+        out.append(("time_stop_seconds",
+                    max(300, int(get(symbol, "time_stop_seconds") * 0.7)),
+                    "TIME_STOP в минус — сократить тайм-стоп"))
+    
     return out[:2]

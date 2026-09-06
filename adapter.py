@@ -1,4 +1,4 @@
-# adapter.py - независимый адаптивный движок (v11)
+# adapter.py - независимый адаптивный движок (v12)
 import asyncio, json, time, sqlite3
 import analyzer
 
@@ -9,6 +9,14 @@ class Adapter:
         self.state=None;self.CONFIG=None;self.get_param=None;self.config_api=None
         self.kn_conn,self.kn_cur=self._init()
         self.last_n={};self.last_eval={};self.last_decision={};self.canary={};self.version=0
+        # Для гистерезиса смен стратегии: хранит (candidate_strategy, count)
+        self._streaks = {}
+        # Для hourly adaptation
+        self.last_hour_adapt = 0
+        # Для auto-rebalance убыточных пар
+        self.last_rebalance_check = 0
+        # Для кулдаунов правил (TASK v13 PR1 3.7)
+        self.last_rule_ts = {}
     def _init(self):
         conn=sqlite3.connect(KN,check_same_thread=False);c=conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS adaptive_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,
@@ -41,38 +49,411 @@ class Adapter:
         self.kn_cur.execute("INSERT INTO adaptive_log(ts,symbol,param,old,new,reason) VALUES(?,?,?,?,?,?)",
             (time.time(),symbol,param,str(old),str(new),reason))
     def bump(self,note):
-        self.version+=1
+        """Record a new config_versions entry only if overrides changed since last version.
+        Avoid noisy duplicate entries when nothing actually changed.
+        """
+        try:
+            cur_overrides = json.dumps(self.CONFIG.get("pair_overrides",{}), sort_keys=True)
+        except Exception:
+            cur_overrides = json.dumps(self.CONFIG.get("pair_overrides",{}))
+        # fetch last overrides
+        self.kn_cur.execute("SELECT overrides FROM config_versions ORDER BY version DESC LIMIT 1")
+        r = self.kn_cur.fetchone()
+        last_overrides = (r[0] if r and r[0] is not None else None)
+        if last_overrides is not None:
+            try:
+                # normalize JSON string for comparison
+                import json as _json
+                last_norm = _json.dumps(_json.loads(last_overrides), sort_keys=True)
+            except Exception:
+                last_norm = last_overrides
+        else:
+            last_norm = None
+        # If overrides identical, do not create a new version entry
+        if last_norm == cur_overrides:
+            return
+        # Otherwise insert new version
+        self.version += 1
         self.kn_cur.execute("INSERT INTO config_versions(ts,version,overrides,note) VALUES(?,?,?,?)",
-            (time.time(),self.version,json.dumps(self.CONFIG.get("pair_overrides",{})),note))
+            (time.time(),self.version,cur_overrides,note))
     def save_knowledge(self,symbol,strat,rm,reason,locked):
+        # Do not overwrite pair_knowledge for locked pairs — adapter must not change locked settings (PR2 §4.4)
+        if locked:
+            # If there's no existing knowledge row, don't create one either — respect manual lock
+            self.kn_cur.execute("SELECT 1 FROM pair_knowledge WHERE symbol=?",(symbol,))
+            if self.kn_cur.fetchone():
+                return
+            else:
+                return
         self.kn_cur.execute("INSERT OR REPLACE INTO pair_knowledge(symbol,ts,strategy,risk_mult,reason,locked) VALUES(?,?,?,?,?,?)",
             (symbol,time.time(),strat,rm,reason,1 if locked else 0))
     # --- оценка пары ---
-    def eval(self,symbol,ov):
+    async def eval(self,symbol,ov):
         rows=analyzer.get_rows(self.state.db_conn,symbol,72)
         m=analyzer.trade_metrics(rows)
         h1,h2=analyzer.halves(rows)
         scores=analyzer.strategy_scores(rows)
         lr=self.read_regime(symbol)
-        reg={"vol_rel":lr[0],"trendiness":lr[1],"wall_share":lr[2]}
+        reg={"vol_rel":lr[0],"trendiness":lr[1],"wall_share":lr[2],"atr_pct":lr[3]}
         bo={"active":bool(lr[4]),"side":lr[5]}
         last_trade=max((r[5] for r in rows),default=0)
         stale=(time.time()-last_trade)>2*3600
         locked=bool(ov.get("locked"))
         current=ov.get("adapter_strategy") or "AUTO"
-        strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale)
+        
+        # --- Режимы адаптера (aggressive/balanced/tight/manual)
+        mode = self.get_param(symbol, "adapter_mode") or "balanced"
+        
+        if mode == "manual":
+            # Адаптер выключен, не трогаем настройки
+            return
+        
+        # Параметры режима
+        if mode == "aggressive":
+            default_rm = 1.0
+            off_floor = -0.01
+            min_sample = 10
+        elif mode == "tight":
+            default_rm = 0.25
+            off_floor = -0.05
+            min_sample = 30
+        else:  # balanced
+            default_rm = 0.5
+            off_floor = -0.03
+            min_sample = 20
+        
+        strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale,m,h1,h2,min_sample=min_sample,off_floor=off_floor)
+        
+        # Если decide_strategy вернул canary (rm=0.5), используем default_rm из режима
+        if abs(rm - 0.5) < 1e-9 and strat != "OFF":
+            rm = default_rm
+            reason = reason + f" | режим {mode} x{default_rm}"
+
+        # --- Холодный старт: если мало данных, но ATR явно велик, предпочесть TREND вместо WALL
+        atr_pct=reg.get("atr_pct",0)
+        atr_floor=self.CONFIG.get("min_atr_pct_abs",0.0016)
+        atr_threshold=max(atr_floor*2,0.0025)
+        if m.get("n",0)<min_sample and atr_pct>=atr_threshold and strat=="WALL":
+            strat="TREND"
+            # по умолчанию даём умеренный risk, но уменьшенный канарейкой при малом числе сделок
+            base_rm = default_rm
+            canary = float(self.CONFIG.get("canary_fraction",0.25))
+            rm = base_rm * (canary if m.get("n",0)<min_sample else 1.0)
+            reason=f"холодный старт: высокий ATR {atr_pct:.5f} -> TREND (canary x{canary})"
+
+        # --- Не пиннить WALL в FLAT без стен: fallback в OFF (ожидание)
+        if strat=="WALL" and reg.get("wall_share",0)<0.2:
+            strat="OFF"
+            rm=0.0
+            reason=f"FLAT без стен (wall_share={reg.get('wall_share',0):.2f}) -> OFF"
+        
+        # TASK 2.8: Авто-разблокировка stale OFF
+        # Если set==AUTO и adapter_strategy=="OFF" не подтверждён split-валидацией
+        # (обе половины окна < off_floor) за последние 2 eval — сбросить в рекомендацию
+        cur_set = ov.get("strategy") or "AUTO"
+        cur_as = ov.get("adapter_strategy")
+        if cur_set == "AUTO" and cur_as == "OFF" and not locked:
+            # Проверяем split-валидацию: если хотя бы одна половина >= off_floor, OFF не подтверждён
+            h1_net = h1.get("net_per_trade", -999) if h1 else -999
+            h2_net = h2.get("net_per_trade", -999) if h2 else -999
+            off_floor_check = off_floor  # из режима
+            
+            # Если хотя бы одна половина не хуже off_floor, OFF не обоснован
+            if h1_net >= off_floor_check or h2_net >= off_floor_check:
+                # Проверяем последние 2 решения из last_decision
+                prev_decisions = []
+                for i in range(2):
+                    self.kn_cur.execute("SELECT new FROM adaptive_log WHERE symbol=? AND param='adapter_strategy' ORDER BY ts DESC LIMIT 1 OFFSET ?", (symbol, i))
+                    row = self.kn_cur.fetchone()
+                    if row:
+                        prev_decisions.append(row[0])
+                
+                # Если в последних 2 решениях было OFF, но split не подтверждает — сбрасываем
+                if prev_decisions.count("OFF") >= 2:
+                    rec, rec_reason = analyzer.recommend(reg)
+                    strat = rec
+                    rm = default_rm * 0.5  # канарейка для переразведки
+                    reason = f"авто-разблокировка stale OFF: split-валидация не подтверждает (h1={h1_net:.3f}, h2={h2_net:.3f} vs floor={off_floor_check:.3f}) -> {rec}"
+
         changes=[]
+        # --- Гистерезис смен стратегии: применяем изменение только после N подряд рекомендаций (из CONFIG)
         if not locked:
-            if ov.get("adapter_strategy")!=strat: changes.append(("adapter_strategy",ov.get("adapter_strategy"),strat,reason))
-            if abs((ov.get("risk_mult") or 1.0)-rm)>1e-9: changes.append(("risk_mult",ov.get("risk_mult"),rm,reason))
-            changes+=analyzer.adaptive_rules(m,h1,h2,self.get_param,symbol)
-            for param,old,new,rsn in changes:
-                ov[param]=new; self.log(symbol,param,old,new,rsn)
+            cur_as=ov.get("adapter_strategy")
+            hyst_count = int(self.CONFIG.get("adapter_hysteresis_count",3))
+            
+            # TASK 2.7: Хистерезис первого входа — без стрика на cold-start
+            is_cold_start = m.get("n", 0) < min_sample
+            
+            # обработка смены adapter_strategy с гистерезисом
+            if cur_as!=strat:
+                # Если холодный старт и первая смена OFF->стратегия — применяем сразу (TASK 2.7)
+                if is_cold_start and (cur_as == "OFF" or cur_as is None):
+                    # Первая смена на cold-start — сразу применяем
+                    changes.append(("adapter_strategy",cur_as,strat,reason + " [cold-start first change]"))
+                    self._streaks[symbol]={"cand":None,"count":0}
+                else:
+                    st=self._streaks.get(symbol, {"cand":None,"count":0})
+                    if st.get("cand")==strat:
+                        st["count"]+=1
+                    else:
+                        st={"cand":strat,"count":1}
+                    self._streaks[symbol]=st
+                    # если достигли порога — применяем изменение (но учитываем cooldown по времени)
+                    if st["count"]>=hyst_count:
+                        # Enforce time-based cooldown for strategy change (CONFIG['hysteresis'] seconds)
+                        cooldown = int(self.CONFIG.get("hysteresis", 21600))
+                        self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='adapter_strategy' ORDER BY ts DESC LIMIT 1", (symbol,))
+                        last_row = self.kn_cur.fetchone()
+                        last_ts = float(last_row[0]) if last_row else 0
+                        now_ts = time.time()
+                        if last_row and (now_ts - last_ts) < cooldown:
+                            # rate-limited — do not apply, record for observability
+                            self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,
+                                                         "reason":f"rate-limited strategy change ({int(now_ts-last_ts)}s<{cooldown}s): {reason}",
+                                                         "ts":now_ts,"locked":locked}
+                        else:
+                            changes.append(("adapter_strategy",cur_as,strat,reason))
+                            # сбросим стрик после применения
+                            self._streaks[symbol]={"cand":None,"count":0}
+                    else:
+                        # не меняем пока не накопим стрик — обновим last_decision для наблюдаемости
+                        self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":f"hysteresis {st['count']}/{hyst_count}: {reason}","ts":time.time(),"locked":locked}
+            else:
+                # совпадение с текущей стратегией — сброс стрика
+                self._streaks[symbol]={"cand":None,"count":0}
+
+            # risk_mult и adaptive_rules применяются сразу (no hysteresis)
+            if abs((ov.get("risk_mult") or 1.0)-rm)>1e-9:
+                rm_reason = reason
+                # If we're setting risk_mult to zero, include split-halves info in the log per PR2 §4.4
+                if abs(rm) < 1e-9:
+                    rm_reason = reason + f" | halves: h1={h1}, h2={h2}"
+                
+                # TASK 2.6: Исключения из risk_change_cooldown
+                # Не применяется при: cold-start (n < min_sample), size-bump, первая смена OFF->стратегия
+                cooldown = float(self.CONFIG.get("risk_change_cooldown", 21600))
+                skip_cooldown = False
+                
+                # Проверка на cold-start
+                if m.get("n", 0) < min_sample:
+                    skip_cooldown = True
+                    rm_reason = rm_reason + " [cold-start]"
+                
+                # Проверка на size-bump (если причина содержит size-bump)
+                if "size-bump" in rm_reason.lower():
+                    skip_cooldown = True
+                    rm_reason = rm_reason + " [size-bump]"
+                
+                # Проверка на первую смену OFF->стратегия
+                cur_strat = ov.get("adapter_strategy") or "OFF"
+                if cur_strat == "OFF" and strat != "OFF":
+                    skip_cooldown = True
+                    rm_reason = rm_reason + " [first OFF->strat]"
+                
+                self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='risk_mult' ORDER BY ts DESC LIMIT 1",(symbol,))
+                last = self.kn_cur.fetchone()
+                now_ts = time.time()
+                
+                if last and not skip_cooldown and (now_ts - float(last[0]) < cooldown):
+                    # Skip applying risk change due to cooldown; record decision for observability
+                    self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,"reason":f"rate-limited risk change ({int(now_ts-last[0])}s<{int(cooldown)}s): {rm_reason}","ts":now_ts,"locked":locked}
+                else:
+                    changes.append(("risk_mult",ov.get("risk_mult"),rm,rm_reason))
+            
+            # Передаём perf_by_strategy в adaptive_rules (TASK v13 PR1 3.1)
+            perf = analyzer.perf_by_strategy(rows)
+            rules = analyzer.adaptive_rules(m, h1, h2, self.get_param, symbol, perf)
+            
+            # Применяем кулдауны к правилам (TASK v13 PR1 3.7): не чаще 1 раза в 6ч на (symbol, param)
+            cooldown_seconds = 6 * 3600
+            now_ts = time.time()
+            changes_with_cooldown = []
+            for _rule in rules:
+                if len(_rule)==4: param,old,new,rsn=_rule
+                else: param,new,rsn=_rule; old=self.get_param(symbol,param)
+                key = (symbol, param)
+                last_ts = self.last_rule_ts.get(key, 0)
+                if now_ts - last_ts < cooldown_seconds:
+                    continue  # пропускаем из-за кулдауна
+                changes_with_cooldown.append((param, old, new, rsn))
+                self.last_rule_ts[key] = now_ts
+                # Лог с метриками для наблюдаемости (TASK v13 PR1 3.7)
+                metrics_snapshot = {
+                    "wr": m.get("wr", 0),
+                    "n": m.get("n", 0),
+                    "avg_mfe": m.get("avg_mfe", 0),
+                    "sl_n": perf.get("STOP_LOSS", {}).get("n", 0) if perf else 0,
+                    "sl_wr": perf.get("STOP_LOSS", {}).get("wr", 0) if perf else 0,
+                }
+                self.log(symbol, param, old, new, f"{rsn} | metrics={metrics_snapshot}")
+            
+            changes += changes_with_cooldown
+
+            # если есть изменения (включая adapter_strategy при достижении порога) — применяем
             if changes:
-                self.bump(f"adaptive {symbol}"); self.config_api._save()
-        # Всегда сохраняем актуальное risk_mult для полного отслеживания состояния
+                try:
+                    _norm=[]
+
+                    for _ch in changes:
+
+                        if len(_ch)==3:
+
+                            _p,_nw,_rs=_ch; _norm.append((_p,ov.get(_p),_nw,_rs))
+
+                        elif len(_ch)==4:
+
+                            _norm.append(_ch)
+
+                    changes=_norm
+
+                    for _ch in changes:  # lenient-v2
+                        if not isinstance(_ch,(list,tuple)) or len(_ch)<3: continue
+                        if len(_ch)==4: param,old,new,rsn=_ch
+                        else: param,new,rsn=_ch; old=ov.get(param)
+                        ov[param]=new; self.log(symbol,param,old,new,rsn)
+                    self.bump(f"adaptive {symbol}"); self.config_api._save()
+                except ValueError as e:
+                    # Детальная диагностика: какие changes пришли
+                    logger.error(f"adaptive_rules вернул неправильный формат: {e}")
+                    for i, ch in enumerate(changes):
+                        logger.error(f"  change[{i}]: {ch} (len={len(ch) if hasattr(ch, '__len__') else '?'})")
+                    # Пропускаем запись изменений, но продолжаем работу
+
+        # --- Adaptive allowed_side по 1h EMA-slope (>=3 подряд) ---
+        try:
+            if self.CONFIG.get("adaptive_enabled", True) and not self.CONFIG.get("locked_strict", False) and not locked:
+                # Собираем последние рыночные снимки за последние 6 часов
+                since = time.time() - 6*3600
+                cur = self.state.db_conn.cursor()
+                cur.execute("SELECT timestamp,price FROM market_snapshots WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC", (symbol, since))
+                rows_ms = cur.fetchall()
+                if rows_ms:
+                    # Группируем по hourly bucket и собираем цены внутри часа
+                    hours = {}
+                    for ts, price in rows_ms:
+                        h = int(ts)//3600
+                        hours.setdefault(h, []).append(float(price))
+                    hour_keys = sorted(hours.keys())
+                    def ema_trend_local(closes, period=int(self.CONFIG.get("ema_period",20)), band=float(self.CONFIG.get("trend_price_tolerance_pct",0.001))):
+                        if not closes: return "FLAT"
+                        e = closes[0]
+                        for c in closes[1:]:
+                            e = (c - e) * (2.0/(period+1)) + e
+                        if closes[-1] > e*(1+band): return "BULLISH"
+                        if closes[-1] < e*(1-band): return "BEARISH"
+                        return "FLAT"
+                    hour_trends = []
+                    for hk in hour_keys:
+                        cls = hours[hk]
+                        # Нужны хотя бы несколько тиков внутри часа
+                        if len(cls) >= 3:
+                            hour_trends.append(ema_trend_local(cls))
+                    # Если есть 3 подряд одинаковых тренда — задаём allowed_side
+                    desired_side = None
+                    if len(hour_trends) >= 3:
+                        last3 = hour_trends[-3:]
+                        if all(t=="BULLISH" for t in last3): desired_side = "Buy"
+                        elif all(t=="BEARISH" for t in last3): desired_side = "Sell"
+                    # Применяем cooldown 6ч (настройка hysteresis в CONFIG использована как cooldown)
+                    cooldown = int(self.CONFIG.get("hysteresis", 21600))
+                    self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='allowed_side' ORDER BY ts DESC LIMIT 1", (symbol,))
+                    last_row = self.kn_cur.fetchone()
+                    last_ts = float(last_row[0]) if last_row else 0
+                    # Получим текущее override
+                    cur_allowed = ov.get("allowed_side")
+                    if desired_side:
+                        if cur_allowed != desired_side and (time.time() - last_ts) >= cooldown:
+                            old = cur_allowed
+                            ov["allowed_side"] = desired_side
+                            self.log(symbol, "allowed_side", old, desired_side, f"adaptive 1h EMA x3 -> {desired_side}")
+                            self.bump(f"allowed_side {symbol}")
+                            self.config_api._save()
+                    else:
+                        # Авто-сброс в BOTH при развороте (один цикл)
+                        if cur_allowed in ("Buy","Sell") and hour_trends:
+                            last_hour = hour_trends[-1]
+                            mapped = "BULLISH" if cur_allowed=="Buy" else "BEARISH"
+                            if last_hour and last_hour != mapped:
+                                old = cur_allowed
+                                ov["allowed_side"] = "BOTH"
+                                self.log(symbol, "allowed_side", old, "BOTH", f"1h trend reversal ({last_hour}) -> BOTH (one cycle)")
+                                self.bump(f"allowed_side_rev {symbol}")
+                                self.config_api._save()
+        except Exception:
+            # Не ломаем адаптер из-за логики allowed_side
+            pass
+
+        # --- Size-bump по эффективному множителю (TASK 2.2) ---
+        # Эффектив = база x canary. Формула: new_rm = min(2.0, required_rm / max(canary, 0.05))
+        # Проверяем только если стратегия не OFF и есть позиция или готовность к входу
+        if strat != "OFF":
+            # Получаем min_qty для символа
+            _si = self.state.sym_info.get(symbol, (0, {}))
+            sinfo = _si[1] if isinstance(_si, tuple) else (_si or {})
+            min_qty = sinfo.get("min_qty", 0)
+            if min_qty > 0:
+                # Берём последнюю цену из orderbook или last_prices
+                mid = 0.0
+                ob = self.state.orderbooks.get(symbol, {})
+                bids = ob.get("bids") if ob else None
+                asks = ob.get("asks") if ob else None
+                if bids and asks:
+                    mid = (max(bids) + min(asks)) / 2
+                else:
+                    mid = self.state.last_prices.get(symbol, 0.0)
+                
+                if mid > 0:
+                    from utils import compute_required_rm
+                    balance = self.state.stats.get('virtual_balance', 500.0)
+                    margin_pct = self.get_param(symbol, "margin_pct") or 0.01
+                    leverage = self.CONFIG.get("leverage", 5)
+                    
+                    required_rm = compute_required_rm(min_qty, mid, balance, margin_pct, leverage)
+                    
+                    # Вычисляем canary (эффективный множитель)
+                    canary_val = self.canary.get(symbol, 1.0)
+                    effective_multiplier = max(canary_val, 0.05)
+                    
+                    # Если required_rm > текущий rm * canary, нужно сделать bump
+                    current_effective = rm * effective_multiplier
+                    if required_rm > current_effective and required_rm <= 2.0:
+                        # Формула bump по эффективному множителю
+                        new_rm = min(2.0, required_rm / effective_multiplier)
+                        if abs(new_rm - rm) > 1e-9:
+                            old_rm = rm
+                            rm = new_rm
+                            reason = reason + f" | size-bump eff: req={required_rm:.3f} eff_mult={effective_multiplier:.3f} -> rm={new_rm:.3f}"
+                            self.log(symbol, "risk_mult", old_rm, new_rm, reason)
+        
+        # Сохраним целевой (базовый) rm до применения canary — он нам понадобится для возможного рапма
+        target_rm = rm
+        # Если мало данных по паре — дополнительно уменьшить риск по canary_fraction
+        canary = float(self.CONFIG.get("canary_fraction",0.25))
+        if m.get("n",0) < self.CONFIG.get("min_sample",20):
+            if canary>0 and canary<1 and abs(rm-0.25)<1e-9:
+                rm = rm * canary
+                reason = (self.last_decision.get(symbol,{}).get("reason",reason) + f" | canary x{canary}")
+                # Простая логика рапма: если в последних K сделках >= W прибыльных — восстановить риск до target_rm
+                ramp_wins = int(self.CONFIG.get("canary_ramp_wins",2))
+                ramp_window = int(self.CONFIG.get("canary_ramp_window",3))
+                recent = rows[-ramp_window:] if rows else []
+                wins = sum(1 for r in recent if r[0]>0)
+                if wins>=ramp_wins:
+                    old_rm = rm
+                    rm = target_rm
+                    reason = reason + f" | canary ramp {wins}/{ramp_window} -> rm restored"
+                    # сохраняем в adaptive_log для аудита
+                    self.log(symbol,"risk_mult",old_rm,rm,f"canary ramp after {wins}/{ramp_window} wins")
+        # Всегда сохраняем актуальное risk_mult/decision для полного отслеживания состояния
         self.canary[symbol]=rm
-        self.last_decision[symbol]={"strategy":strat,"risk_mult":rm,"reason":reason,"ts":time.time(),"locked":locked}
+        # Если last_decision ещё не установлен выше in hysteresis branch, установим его
+        if symbol not in self.last_decision:
+            self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,"reason":reason,"ts":time.time(),"locked":locked}
+        self.last_decision[symbol]["strategy"] = strat
+        self.last_decision[symbol]["risk_mult"] = rm
+        self.last_decision[symbol]["reason"] = self.last_decision[symbol].get("reason",reason)
+        self.last_decision[symbol]["ts"] = time.time()
+
         self.save_knowledge(symbol,strat,rm,reason,locked)
         for s,pm in analyzer.perf_by_strategy(rows).items():
             self.kn_cur.execute("INSERT INTO strategy_performance(ts,symbol,strategy,trades,wr,gross,fees,net,avg_mfe,avg_mae) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -82,17 +463,95 @@ class Adapter:
         while True:
             await asyncio.sleep(60)
             try:
+                evaluated=[]
                 for symbol in self.CONFIG["symbols"]:
                     ov=self.CONFIG.setdefault("pair_overrides",{}).setdefault(symbol,{})
                     self.state.db_cursor.execute("SELECT COUNT(*) FROM trades WHERE symbol=?",(symbol,))
                     n=self.state.db_cursor.fetchone()[0]
                     need_event=(n-self.last_n.get(symbol,n))>=10
                     if need_event or (time.time()-self.last_eval.get(symbol,0))>900:
-                        self.eval(symbol,ov)
+                        await self.eval(symbol,ov)
                         self.last_n[symbol]=n;self.last_eval[symbol]=time.time()
+                    # collect a quick view whether pair is effectively skipped/off
+                    # consider skipped if adapter set risk_mult==0 or adapter_strategy=="OFF" or pair_overrides risk_mult==0
+                    ov_effective = ov.get("risk_mult", None)
+                    adapter_as = ov.get("adapter_strategy")
+                    canary_val = self.canary.get(symbol, None)
+                    skipped = (ov_effective == 0) or (adapter_as == "OFF") or (canary_val == 0)
+                    evaluated.append((symbol, skipped, ov.get("locked", False)))
+
+                # After evaluating all symbols — anti-deadlock: if ALL pairs are skipped/off, pick a fee-positive pair
+                # with max atr_pct and set a canary on it (but do NOT touch locked pairs)
+                if evaluated and all(s for (_, s, __) in evaluated):
+                    # find candidate by reading live_regime table
+                    candidates=[]
+                    min_atr = float(self.CONFIG.get("min_atr_pct_abs", 0.0016))
+                    for sym in self.CONFIG.get("symbols",[]):
+                        # do not override locked pairs
+                        ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
+                        if ov.get("locked"): continue
+                        self.kn_cur.execute("SELECT atr_pct FROM live_regime WHERE symbol=?",(sym,))
+                        r=self.kn_cur.fetchone()
+                        atr_pct = (r[0] if r else 0) if r else 0
+                        if atr_pct>=min_atr:
+                            candidates.append((sym,atr_pct))
+                    if candidates:
+                        # pick max atr_pct
+                        best = max(candidates, key=lambda x:x[1])[0]
+                        ov_best = self.CONFIG.setdefault("pair_overrides",{}).setdefault(best,{})
+                        # set a canary risk_mult=0.5 and adapter_strategy per recommend (if not OFF)
+                        reg = self.read_regime(best)
+                        reg_dict={"atr_pct":reg[3],"trendiness":reg[1],"vol_rel":reg[0],"wall_share":reg[2],"min_atr_pct_abs":min_atr}
+                        rec, reason = analyzer.recommend(reg_dict)
+                        # Only set if recommended is tradeable (not OFF)
+                        if rec != "OFF":
+                            # write override but respect locked check above
+                            old_rm = ov_best.get("risk_mult")
+                            ov_best["risk_mult"] = ov_best.get("risk_mult",1.0) * 0.5 if ov_best.get("risk_mult") is not None else 0.5
+                            ov_best["adapter_strategy"] = ov_best.get("adapter_strategy") or rec
+                            self.log(best, "risk_mult", old_rm, ov_best["risk_mult"], f"anti-deadlock canary (picked by atr_pct={reg_dict['atr_pct']})")
+                            self.bump(f"canary {best}")
+                            self.config_api._save()
                 self.kn_conn.commit()
+                
+                # --- Часовая адаптация (раз в 6ч): токсичные часы -> blacklist
+                if time.time() - self.last_hour_adapt > 6*3600:
+                    self.last_hour_adapt = time.time()
+                    for sym in self.CONFIG.get("symbols",[]):
+                        ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
+                        if ov.get("locked"): continue
+                        rows = analyzer.get_rows(self.state.db_conn, sym, 72)
+                        hours = analyzer.hour_stats(rows, worst=5)
+                        toxic_hours = [h["h"] for h in hours if h["net"] < -0.5 and h["n"] >= 3]
+                        if toxic_hours:
+                            current_blacklist = ov.get("trading_hours_blacklist", [])
+                            new_blacklist = list(set(current_blacklist + toxic_hours))
+                            if new_blacklist != current_blacklist:
+                                ov["trading_hours_blacklist"] = new_blacklist
+                                self.log(sym, "trading_hours_blacklist", current_blacklist, new_blacklist, f"часовая адаптация: токсичные {toxic_hours}")
+                                self.bump(f"часы {sym}")
+                                self.config_api._save()
+                
+                # --- Авто-ребаланс убыточных пар (раз в 24ч): 8/10 убыточных -> OFF на 24ч
+                if time.time() - self.last_rebalance_check > 24*3600:
+                    self.last_rebalance_check = time.time()
+                    for sym in self.CONFIG.get("symbols",[]):
+                        ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
+                        if ov.get("locked"): continue
+                        rows = analyzer.get_rows(self.state.db_conn, sym, 24)
+                        if len(rows) >= 10:
+                            last_10 = sorted(rows, key=lambda r: r[5], reverse=True)[:10]
+                            losses = sum(1 for r in last_10 if r[0] <= 0)
+                            if losses >= 8:
+                                cur_strat = ov.get("adapter_strategy")
+                                if cur_strat != "OFF":
+                                    ov["adapter_strategy"] = "OFF"
+                                    ov["risk_mult"] = 0.0
+                                    self.log(sym, "adapter_strategy", cur_strat, "OFF", f"авто-ребаланс: {losses}/10 убыточных за 24ч")
+                                    self.bump(f"авто-OFF {sym}")
+                                    self.config_api._save()
             except Exception as e:
-                print("adapter err:",e)
+                import traceback as _tb; _tb.print_exc(); print("adapter err:",e)
     # --- состояние для UI ---
     def public_state(self):
         self.kn_cur.execute("SELECT symbol,param,old,new,reason,ts FROM adaptive_log ORDER BY id DESC LIMIT 50")

@@ -1,4 +1,4 @@
-# config_api.py - runtime-конфиг (v11.1)
+# config_api.py - runtime-конфиг (v12)
 import json
 import os
 import logging
@@ -24,6 +24,7 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
     "ws_ping_interval": {"group":"Система","type":"int","min":5,"max":60,"step":5,"desc":"Ping WS интервал."},
     "ws_ping_timeout": {"group":"Система","type":"int","min":5,"max":30,"step":1,"desc":"Ping WS таймаут."},
     "bybit_base_url": {"group":"Система","type":"str","desc":"Базовый URL Bybit API."},
+    "autostart": {"group":"Система","type":"bool","default":True,"desc":"Автозапуск торговли при старте сервиса (paper)."},
     "virtual_balance": {"group":"Система","type":"float","min":10,"max":100000,"step":10,"desc":"Виртуальный баланс (paper trading)."},
     "leverage": {"group":"Риск и сайзинг","type":"int","min":1,"max":100,"step":1,"desc":"Плечо. Нотационная = маржа × плечо."},
     "margin_pct": {"group":"Риск и сайзинг","type":"float","min":0.01,"max":0.5,"step":0.01,"desc":"Маржа = баланс × margin_pct."},
@@ -56,6 +57,12 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
     "trend_tp_atr_mult": {"group":"TREND","type":"float","min":0.5,"max":10,"step":0.5,"desc":"TP = ATR × N (если больше пола)."},
     "imbalance_threshold": {"group":"TREND","type":"float","min":0.1,"max":0.95,"step":0.05,"desc":"Порог дисбаланса стакана."},
     "imbalance_confirmation_ticks": {"group":"TREND","type":"int","min":1,"max":20,"step":1,"desc":"Тиков подтверждения дисбаланса."},
+    "adapter_hysteresis_count": {"group":"Адаптер","type":"int","min":1,"max":10,"step":1,"desc":"Число циклов для гистерезиса смен стратегии."},
+    "canary_fraction": {"group":"Адаптер","type":"float","min":0.01,"max":1.0,"step":0.01,"desc":"Фракция риска для canary при малом sample (0.25 = 25%)."},
+    "canary_ramp_wins": {"group":"Адаптер","type":"int","min":1,"max":10,"step":1,"desc":"Число прибыльных сделок в окне для восстановления риска после canary."},
+    "canary_ramp_window": {"group":"Адаптер","type":"int","min":1,"max":10,"step":1,"desc":"Окно последних сделок для проверки canary ramp."},
+    "risk_change_cooldown": {"group":"Адаптер","type":"int","min":60,"max":86400,"step":60,"desc":"Cooldown seconds between risk_mult changes (default 21600s = 6h)."},
+    "adapter_mode": {"group":"Адаптер","type":"str","desc":"Режим адаптера: aggressive/balanced/tight/manual"},
     "swing_sl_atr_mult": {"group":"SWING","type":"float","min":1,"max":10,"step":0.5,"desc":"SL = ATR(1h) × N."},
     "swing_tp_atr_mult": {"group":"SWING","type":"float","min":1,"max":15,"step":0.5,"desc":"TP = ATR(1h) × N."},
     "swing_time_stop": {"group":"SWING","type":"int","min":3600,"max":604800,"step":3600,"desc":"Тайм-стоп свинга."},
@@ -89,6 +96,9 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
 
 def _coerce(meta: Dict[str, Any], value: Any) -> Any:
     """Преобразует значение к типу, указанному в мета-описании."""
+    # BUG-2: null-загрязнение — возвращаем None без warning
+    if value is None:
+        return None
     t = meta.get("type", "float")
     try:
         if t == "bool":
@@ -143,8 +153,14 @@ def _save() -> bool:
         cfg = _state["config"]
         if cfg is None:
             return False
-        data = {k: cfg.get(k) for k in CONFIG_META}
-        data["pair_overrides"] = cfg.get("pair_overrides", {})
+        # BUG-2: не пишем null-значения в конфиг
+        data = {k: cfg.get(k) for k in CONFIG_META if cfg.get(k) is not None}
+        # pair_overrides также фильтруем от null
+        po = cfg.get("pair_overrides", {})
+        if isinstance(po, dict):
+            data["pair_overrides"] = {sym: ov for sym, ov in po.items() if ov is not None}
+        else:
+            data["pair_overrides"] = {}
         with open(_state["path"], "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.debug(f"Config saved to {_state['path']}")
@@ -161,7 +177,7 @@ def get_config() -> Dict[str, Any]:
     if cfg is None:
         raise HTTPException(status_code=500, detail="Configuration not initialized")
     
-    result = {}
+    result = {"_meta": {"version": _state.get("config_version", 0)}}
     with _state["lock"]:
         for k, v in CONFIG_META.items():
             item = dict(v)
@@ -218,3 +234,42 @@ async def set_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(f"Symbols hook error: {e}")
     
     return {"ok": True, "restart_required": restart_required}
+
+
+@router.post("/api/config/reset")
+async def reset_config() -> Dict[str, Any]:
+    """Сбрасывает все параметры конфигурации к значениям по умолчанию."""
+    cfg = _state["config"]
+    if cfg is None:
+        raise HTTPException(status_code=500, detail="Configuration not initialized")
+    
+    # Извлекаем дефолтные значения из CONFIG_META (первое значение для list, False для bool)
+    with _state["lock"]:
+        for k, meta in CONFIG_META.items():
+            t = meta.get("type", "float")
+            if t == "bool":
+                default_val = False
+            elif t == "list":
+                default_val = []
+            elif t == "int":
+                default_val = int(meta.get("min", 0))
+            elif t == "float":
+                default_val = float(meta.get("min", 0.0))
+            elif t == "str":
+                default_val = ""
+            else:
+                default_val = None
+            
+            if default_val is not None:
+                cfg[k] = default_val
+        
+        _save()
+    
+    # Вызов хука для обновления символов (если symbols был сброшен)
+    if symbols_hook:
+        try:
+            await symbols_hook(cfg["symbols"])
+        except Exception as e:
+            logger.error(f"Symbols hook error: {e}")
+    
+    return {"ok": True}

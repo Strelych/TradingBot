@@ -8,6 +8,7 @@ __pycache__/
 # Logs and temp files
 *.log
 *.tmp
+*.swp
 
 # Environment
 .env
@@ -17,8 +18,6 @@ __pycache__/
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
 
 # Dependencies
 .venv/
@@ -35,9 +34,7 @@ target/
 coverage/
 htmlcov/
 
-# MyPy
-.mypy_cache/
-
-# Pytest
+# Testing
 .pytest_cache/
+.mypy_cache/
 ```
