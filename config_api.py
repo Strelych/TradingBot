@@ -24,6 +24,7 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
     "ws_ping_interval": {"group":"Система","type":"int","min":5,"max":60,"step":5,"desc":"Ping WS интервал."},
     "ws_ping_timeout": {"group":"Система","type":"int","min":5,"max":30,"step":1,"desc":"Ping WS таймаут."},
     "bybit_base_url": {"group":"Система","type":"str","desc":"Базовый URL Bybit API."},
+    "autostart": {"group":"Система","type":"bool","default":True,"desc":"Автозапуск торговли при старте сервиса (paper)."},
     "virtual_balance": {"group":"Система","type":"float","min":10,"max":100000,"step":10,"desc":"Виртуальный баланс (paper trading)."},
     "leverage": {"group":"Риск и сайзинг","type":"int","min":1,"max":100,"step":1,"desc":"Плечо. Нотационная = маржа × плечо."},
     "margin_pct": {"group":"Риск и сайзинг","type":"float","min":0.01,"max":0.5,"step":0.01,"desc":"Маржа = баланс × margin_pct."},
@@ -95,6 +96,9 @@ CONFIG_META: Dict[str, Dict[str, Any]] = {
 
 def _coerce(meta: Dict[str, Any], value: Any) -> Any:
     """Преобразует значение к типу, указанному в мета-описании."""
+    # BUG-2: null-загрязнение — возвращаем None без warning
+    if value is None:
+        return None
     t = meta.get("type", "float")
     try:
         if t == "bool":
@@ -149,8 +153,14 @@ def _save() -> bool:
         cfg = _state["config"]
         if cfg is None:
             return False
-        data = {k: cfg.get(k) for k in CONFIG_META}
-        data["pair_overrides"] = cfg.get("pair_overrides", {})
+        # BUG-2: не пишем null-значения в конфиг
+        data = {k: cfg.get(k) for k in CONFIG_META if cfg.get(k) is not None}
+        # pair_overrides также фильтруем от null
+        po = cfg.get("pair_overrides", {})
+        if isinstance(po, dict):
+            data["pair_overrides"] = {sym: ov for sym, ov in po.items() if ov is not None}
+        else:
+            data["pair_overrides"] = {}
         with open(_state["path"], "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.debug(f"Config saved to {_state['path']}")

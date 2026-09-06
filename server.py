@@ -11,8 +11,8 @@ from datetime import datetime
 from web_ui import WEB_PAGE
 import config_api, analyzer, adapter
 
-VERSION = "v12.6"
-BRANCH = "v12.6"
+VERSION = "v12.7"
+BRANCH = "v12.7"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger=logging.getLogger("BotServer")
@@ -49,6 +49,7 @@ CONFIG={
  "commission_maker":0.00036,"commission_taker":0.001,
  "ema_period":20,"update_interval":0.2,"data_stale_threshold":5,
  "ws_ping_interval":20,"ws_ping_timeout":10,"bybit_base_url":"https://api.bybit.com",
+ "autostart":True,
 }
 config_api.init_config_api(CONFIG)
 
@@ -94,6 +95,29 @@ def log_warn_throttle(symbol, reason_key, msg, interval=60):
     else:
         # optionally, keep a debug for suppressed logs
         logger.debug(f"throttled warning {symbol} {reason_key} (suppressed)")
+
+# --- REST observability (BUG-1 PR1)
+_rest_state = {"fails": 0, "last_err": "", "ok": True}
+
+def rest_fail(msg):
+    _rest_state["fails"] += 1
+    _rest_state["last_err"] = msg[:80]
+    _rest_state["ok"] = False
+    log_warn_throttle("REST", "down", f"⚠️ REST down: {msg}", 60)
+
+async def fetch_json(url, params=None, ep="rest"):
+    if not state.http_session:
+        await init_http_session()
+    if not state.http_session:
+        rest_fail("no http session"); return None
+    try:
+        async with state.http_session.get(url, params=params) as r:
+            if r.status != 200:
+                rest_fail(f"HTTP {r.status} {ep}"); return None
+            _rest_state["ok"] = True; _rest_state["fails"] = 0
+            return await r.json()
+    except Exception as e:
+        rest_fail(f"{type(e).__name__}: {e} [{ep}]"); return None
 def round_price(p):return round(p,price_decimals(p))
 def round_grid(p):
     if p>=1000:return 100
@@ -197,17 +221,12 @@ def init_db():
 async def init_http_session():state.http_session=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
 async def close_http_session():
     if state.http_session:await state.http_session.close()
-async def fetch_json(url,params=None):
-    if not state.http_session:return None
-    try:
-        async with state.http_session.get(url,params=params) as r:
-            return await r.json() if r.status==200 else None
-    except Exception:return None
+# fetch_json moved up to line 108 with REST observability
 
 async def get_symbol_info(symbol):
     now=time.time()
     if symbol in state.sym_info and now-state.sym_info[symbol][0]<3600:return state.sym_info[symbol][1]
-    data=await fetch_json(f"{CONFIG['bybit_base_url']}/v5/market/instruments-info",{"category":"linear","symbol":symbol})
+    data=await fetch_json(f"{CONFIG['bybit_base_url']}/v5/market/instruments-info",{"category":"linear","symbol":symbol}, ep="info")
     info={}
     if data and data.get("result",{}).get("list"):
         it=data["result"]["list"][0]
@@ -225,7 +244,7 @@ async def get_klines(symbol,interval,limit=100):
     key=(symbol,interval);now=time.time()
     if key in state.kline_cache and now-state.kline_cache[key][0]<15:return state.kline_cache[key][1]
     data=await fetch_json(f"{CONFIG['bybit_base_url']}/v5/market/kline",
-        {"category":"linear","symbol":symbol,"interval":interval,"limit":limit})
+        {"category":"linear","symbol":symbol,"interval":interval,"limit":limit}, ep="kline")
     if not data or not data.get("result",{}).get("list"):return None
     kl=list(reversed(data["result"]["list"]))
     state.kline_cache[key]=(now,kl);return kl
@@ -260,6 +279,10 @@ async def refresh_sr(symbol):
 async def get_trend(symbol,interval):
     kl=await get_klines(symbol,interval,60)
     return ema_trend([float(k[4]) for k in kl]) if kl else "UNKNOWN"
+
+async def get_trend_ep(symbol,interval):
+    """Wrapper for trend endpoint with ep tagging"""
+    return await get_trend(symbol, interval)
 
 class WallTracker:
     def __init__(self):self.walls={s:{} for s in CONFIG["symbols"]}
@@ -406,8 +429,21 @@ def shutdown_cleanup():
 async def lifespan(app):
     state.db_conn,state.db_cursor=init_db()
     await init_http_session()
+    
+    # BUG-1: Validate bybit_base_url on startup (PR1)
+    base_url = CONFIG.get("bybit_base_url") or ""
+    if not base_url.startswith("http"):
+        logger.warning(f"⚠️ bybit_base_url невалиден ({base_url!r}) — восстановлен дефолт")
+        CONFIG["bybit_base_url"] = "https://api.bybit.com"
+    
     state.start_time=time.time();state.load_stats()
     paper_engine.balance=state.stats["virtual_balance"]
+    
+    # BUG-4: Autostart trading (PR1)
+    if CONFIG.get("autostart", True):
+        state.is_trading = True
+        logger.info("▶️ автостарт торговли")
+    
     asyncio.create_task(bybit_ws_handler())
     state.analysis_task=asyncio.create_task(analysis_loop())
     adapter.adapter.start(state,CONFIG,get_param,config_api)
@@ -1156,7 +1192,8 @@ async def websocket_endpoint(websocket:WebSocket):
 @app.get("/api/status")
 async def get_status():
     return{"is_trading":state.is_trading,"symbols":CONFIG["symbols"],"ws_connected":state.ws_connected,
-           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors},
+           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors,
+           "rest_ok":_rest_state["ok"],"rest_fails":_rest_state["fails"],"rest_last_error":_rest_state["last_err"]},
            "version":VERSION}
 
 @app.get("/api/version")
