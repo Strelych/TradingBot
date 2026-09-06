@@ -472,6 +472,8 @@ async def housekeeping():
                     if k=="pair_overrides":CONFIG["pair_overrides"]=v
                     elif k=="symbols":pass
                     elif k in config_api.CONFIG_META:CONFIG[k]=config_api._coerce(config_api.CONFIG_META[k],v)
+                if not (CONFIG.get("bybit_base_url") or "").startswith("http"):
+                    CONFIG["bybit_base_url"]="https://api.bybit.com"
                 if "symbols" in ov and list(ov["symbols"])!=old_syms:
                     await apply_symbols(ov["symbols"])
         except Exception:pass
