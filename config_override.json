@@ -32,8 +32,8 @@
   "tp_atr_mult": 3.0,
   "min_tp_pct": 0.008,
   "tp_round_number_preference": true,
-  "grace_seconds": 2.0,
-  "time_stop_seconds": 900,
+  "grace_seconds": 6.0,
+  "time_stop_seconds": 3600,
   "trend_sl_atr_mult": 1.5,
   "trend_trail_atr_mult": 2.0,
   "trend_tp_pct": 0.006,
@@ -78,7 +78,9 @@
     "ETHUSDT",
     "SOLUSDT",
     "HUSDT",
-    "GRAMUSDT"
+    "GRAMUSDT",
+    "AKEUSDT",
+    "XRPUSDT"
   ],
   "pair_overrides": {
     "BTCUSDT": {
@@ -86,15 +88,49 @@
       "risk_mult": 0.5
     },
     "ETHUSDT": {
-      "adapter_strategy": "OFF",
+      "adapter_strategy": "TREND",
       "risk_mult": 0.5
     },
     "SOLUSDT": {
+      "adapter_strategy": "TREND",
+      "risk_mult": 0.5,
+      "trading_hours_blacklist": [
+        16,
+        17
+      ],
+      "imbalance_confirmation_ticks": 5,
+      "trend_trail_atr_mult": 2.4
+    },
+    "HUSDT": {
+      "adapter_strategy": "OFF",
+      "risk_mult": 0.0,
+      "trend_sl_atr_mult": 1.875,
+      "imbalance_confirmation_ticks": 5,
+      "trading_hours_blacklist": [
+        11,
+        12,
+        14,
+        15
+      ]
+    },
+    "GRAMUSDT": {
       "adapter_strategy": "OFF",
       "risk_mult": 0.5
     },
-    "HUSDT": {
+    "AKEUSDT": {
       "adapter_strategy": "TREND",
+      "risk_mult": 1.0,
+      "trend_sl_atr_mult": 1.875,
+      "trend_trail_atr_mult": 2.4,
+      "trading_hours_blacklist": [
+        16,
+        10,
+        14,
+        15
+      ]
+    },
+    "XRPUSDT": {
+      "adapter_strategy": "OFF",
       "risk_mult": 0.5
     }
   }

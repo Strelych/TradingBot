@@ -268,7 +268,9 @@ class Adapter:
             cooldown_seconds = 6 * 3600
             now_ts = time.time()
             changes_with_cooldown = []
-            for param, old, new, rsn in rules:
+            for _rule in rules:
+                if len(_rule)==4: param,old,new,rsn=_rule
+                else: param,new,rsn=_rule; old=self.get_param(symbol,param)
                 key = (symbol, param)
                 last_ts = self.last_rule_ts.get(key, 0)
                 if now_ts - last_ts < cooldown_seconds:
@@ -289,9 +291,33 @@ class Adapter:
 
             # если есть изменения (включая adapter_strategy при достижении порога) — применяем
             if changes:
-                for param,old,new,rsn in changes:
-                    ov[param]=new; self.log(symbol,param,old,new,rsn)
-                self.bump(f"adaptive {symbol}"); self.config_api._save()
+                try:
+                    _norm=[]
+
+                    for _ch in changes:
+
+                        if len(_ch)==3:
+
+                            _p,_nw,_rs=_ch; _norm.append((_p,ov.get(_p),_nw,_rs))
+
+                        elif len(_ch)==4:
+
+                            _norm.append(_ch)
+
+                    changes=_norm
+
+                    for _ch in changes:  # lenient-v2
+                        if not isinstance(_ch,(list,tuple)) or len(_ch)<3: continue
+                        if len(_ch)==4: param,old,new,rsn=_ch
+                        else: param,new,rsn=_ch; old=ov.get(param)
+                        ov[param]=new; self.log(symbol,param,old,new,rsn)
+                    self.bump(f"adaptive {symbol}"); self.config_api._save()
+                except ValueError as e:
+                    # Детальная диагностика: какие changes пришли
+                    logger.error(f"adaptive_rules вернул неправильный формат: {e}")
+                    for i, ch in enumerate(changes):
+                        logger.error(f"  change[{i}]: {ch} (len={len(ch) if hasattr(ch, '__len__') else '?'})")
+                    # Пропускаем запись изменений, но продолжаем работу
 
         # --- Adaptive allowed_side по 1h EMA-slope (>=3 подряд) ---
         try:
@@ -525,7 +551,7 @@ class Adapter:
                                     self.bump(f"авто-OFF {sym}")
                                     self.config_api._save()
             except Exception as e:
-                print("adapter err:",e)
+                import traceback as _tb; _tb.print_exc(); print("adapter err:",e)
     # --- состояние для UI ---
     def public_state(self):
         self.kn_cur.execute("SELECT symbol,param,old,new,reason,ts FROM adaptive_log ORDER BY id DESC LIMIT 50")
