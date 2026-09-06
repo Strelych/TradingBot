@@ -168,7 +168,7 @@ class Adapter:
                 
                 # Если в последних 2 решениях было OFF, но split не подтверждает — сбрасываем
                 if prev_decisions.count("OFF") >= 2:
-                    rec, rec_reason = recommend(reg)
+                    rec, rec_reason = analyzer.recommend(reg)
                     strat = rec
                     rm = default_rm * 0.5  # канарейка для переразведки
                     reason = f"авто-разблокировка stale OFF: split-валидация не подтверждает (h1={h1_net:.3f}, h2={h2_net:.3f} vs floor={off_floor_check:.3f}) -> {rec}"
@@ -334,20 +334,23 @@ class Adapter:
         # Проверяем только если стратегия не OFF и есть позиция или готовность к входу
         if strat != "OFF":
             # Получаем min_qty для символа
-            sinfo = self.state.sym_info.get(symbol, {})
+            _si = self.state.sym_info.get(symbol, (0, {}))
+            sinfo = _si[1] if isinstance(_si, tuple) else (_si or {})
             min_qty = sinfo.get("min_qty", 0)
             if min_qty > 0:
                 # Берём последнюю цену из orderbook или last_prices
                 mid = 0.0
                 ob = self.state.orderbooks.get(symbol, {})
-                if ob and ob.get("bids") and ob.get("asks"):
-                    mid = (float(ob["bids"][0][0]) + float(ob["asks"][0][0])) / 2
+                bids = ob.get("bids") if ob else None
+                asks = ob.get("asks") if ob else None
+                if bids and asks:
+                    mid = (max(bids) + min(asks)) / 2
                 else:
                     mid = self.state.last_prices.get(symbol, 0.0)
                 
                 if mid > 0:
                     from utils import compute_required_rm
-                    balance = self.state.paper_engine.balance if hasattr(self.state, 'paper_engine') else 500.0
+                    balance = self.state.stats.get('virtual_balance', 500.0)
                     margin_pct = self.get_param(symbol, "margin_pct") or 0.01
                     leverage = self.CONFIG.get("leverage", 5)
                     
@@ -373,7 +376,7 @@ class Adapter:
         # Если мало данных по паре — дополнительно уменьшить риск по canary_fraction
         canary = float(self.CONFIG.get("canary_fraction",0.25))
         if m.get("n",0) < self.CONFIG.get("min_sample",20):
-            if canary>0 and canary<1:
+            if canary>0 and canary<1 and abs(rm-0.25)<1e-9:
                 rm = rm * canary
                 reason = (self.last_decision.get(symbol,{}).get("reason",reason) + f" | canary x{canary}")
                 # Простая логика рапма: если в последних K сделках >= W прибыльных — восстановить риск до target_rm
@@ -444,7 +447,7 @@ class Adapter:
                         ov_best = self.CONFIG.setdefault("pair_overrides",{}).setdefault(best,{})
                         # set a canary risk_mult=0.5 and adapter_strategy per recommend (if not OFF)
                         reg = self.read_regime(best)
-                        reg_dict={"atr_pct":reg[4],"trendiness":reg[1],"vol_rel":reg[0],"wall_share":reg[2],"min_atr_pct_abs":min_atr}
+                        reg_dict={"atr_pct":reg[3],"trendiness":reg[1],"vol_rel":reg[0],"wall_share":reg[2],"min_atr_pct_abs":min_atr}
                         rec, reason = analyzer.recommend(reg_dict)
                         # Only set if recommended is tradeable (not OFF)
                         if rec != "OFF":
