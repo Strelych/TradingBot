@@ -334,7 +334,7 @@ class Adapter:
         # Проверяем только если стратегия не OFF и есть позиция или готовность к входу
         if strat != "OFF":
             # Получаем min_qty для символа
-            sinfo = self.state.symbols_info.get(symbol, {})
+            sinfo = self.state.sym_info.get(symbol, {})
             min_qty = sinfo.get("min_qty", 0)
             if min_qty > 0:
                 # Берём последнюю цену из orderbook или last_prices
