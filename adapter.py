@@ -15,6 +15,8 @@ class Adapter:
         self.last_hour_adapt = 0
         # Для auto-rebalance убыточных пар
         self.last_rebalance_check = 0
+        # Для кулдаунов правил (TASK v13 PR1 3.7)
+        self.last_rule_ts = {}
     def _init(self):
         conn=sqlite3.connect(KN,check_same_thread=False);c=conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS adaptive_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,
@@ -257,7 +259,33 @@ class Adapter:
                     self.last_decision[symbol] = {"strategy":strat,"risk_mult":rm,"reason":f"rate-limited risk change ({int(now_ts-last[0])}s<{int(cooldown)}s): {rm_reason}","ts":now_ts,"locked":locked}
                 else:
                     changes.append(("risk_mult",ov.get("risk_mult"),rm,rm_reason))
-            changes+=analyzer.adaptive_rules(m,h1,h2,self.get_param,symbol)
+            
+            # Передаём perf_by_strategy в adaptive_rules (TASK v13 PR1 3.1)
+            perf = analyzer.perf_by_strategy(rows)
+            rules = analyzer.adaptive_rules(m, h1, h2, self.get_param, symbol, perf)
+            
+            # Применяем кулдауны к правилам (TASK v13 PR1 3.7): не чаще 1 раза в 6ч на (symbol, param)
+            cooldown_seconds = 6 * 3600
+            now_ts = time.time()
+            changes_with_cooldown = []
+            for param, old, new, rsn in rules:
+                key = (symbol, param)
+                last_ts = self.last_rule_ts.get(key, 0)
+                if now_ts - last_ts < cooldown_seconds:
+                    continue  # пропускаем из-за кулдауна
+                changes_with_cooldown.append((param, old, new, rsn))
+                self.last_rule_ts[key] = now_ts
+                # Лог с метриками для наблюдаемости (TASK v13 PR1 3.7)
+                metrics_snapshot = {
+                    "wr": m.get("wr", 0),
+                    "n": m.get("n", 0),
+                    "avg_mfe": m.get("avg_mfe", 0),
+                    "sl_n": perf.get("STOP_LOSS", {}).get("n", 0) if perf else 0,
+                    "sl_wr": perf.get("STOP_LOSS", {}).get("wr", 0) if perf else 0,
+                }
+                self.log(symbol, param, old, new, f"{rsn} | metrics={metrics_snapshot}")
+            
+            changes += changes_with_cooldown
 
             # если есть изменения (включая adapter_strategy при достижении порога) — применяем
             if changes:

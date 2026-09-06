@@ -96,8 +96,11 @@ def halves(rows):
     return trade_metrics(rows[:mid]), trade_metrics(rows[mid:])
 
 def perf_by_strategy(rows):
+    """Группировка метрик по exit_reason (STOP_LOSS, TAKE_PROFIT и т.д.)."""
     d={}
-    for r in rows: d.setdefault(r[8] or "?",[]).append(r)
+    for r in rows:
+        key = r[2] or "?"  # exit_reason - ключ для перформанса по причинам выхода
+        d.setdefault(key, []).append(r)
     return {s:trade_metrics(rs) for s,rs in d.items()}
 
 def strategy_scores(rows, min_n=3):
@@ -206,15 +209,54 @@ def decide_strategy(scores, reg, bo, current, stale, m=None, h1=None, h2=None, m
     rec, reason = recommend(reg)
     return rec, 0.5, f"мало данных / нет eligible: режимная канарейка ×0.5 | {reason}"
 
-def adaptive_rules(m, h1, h2, get, symbol):
+def adaptive_rules(m, h1, h2, get, symbol, perf=None):
+    """Адаптивные правила выходов (TASK v13 PR1).
+    
+    Правила:
+    1) SL никогда не win при >=5 попыток -> расширить стоп TREND
+    2) MFE≈0 на убытках + WR<30 -> входы мёртвые: ужесточить подтверждение
+    3) gross>0, net<=0 -> комиссии съедают: поднять порог трейлинга
+    4) trailing gross>0 net<=0 -> дать прибыли дышать
+    5) TIME_STOP в минус -> сократить время мёртвых сделок
+    """
     out=[]
-    if m.get("n",0)<get(symbol,"min_sample"): return out
-    both=lambda f:(h1 is not None and h2 is not None and f(h1) and f(h2)) or (h1 is None and f(m))
-    if both(lambda x:x.get("inst_stop",0)>0.35):
-        out.append(("wall_min_age_seconds",min(120,get(symbol,"wall_min_age_seconds")+15),"мгновенные стопы>35% (обе половины)"))
-        out.append(("min_sl_distance_pct",min(0.02,get(symbol,"min_sl_distance_pct")*1.15),"мгновенные стопы>35%"))
-    if m.get("avg_mfe",0)>0.008:
-        out.append(("trail_atr_mult",min(6.0,get(symbol,"trail_atr_mult")*1.15),"MFE высокий — дать прибыли дышать"))
-    if m.get("avg_mae",0)>-0.002 and m.get("inst_stop",0)>0.3:
-        out.append(("min_sl_distance_pct",min(0.02,get(symbol,"min_sl_distance_pct")*1.15),"MAE мал — стопы слишком близко"))
+    n = m.get("n", 0)
+    if n < 10: 
+        return out  # гейт ниже для выходов (было 20)
+    
+    perf = perf or {}
+    sl = perf.get("STOP_LOSS")
+    tr = perf.get("TRAILING_STOP")
+    ts = perf.get("TIME_STOP")
+    
+    # 1) SL никогда не win при >=5 попыток -> расширить стоп TREND
+    if sl and sl["n"] >= 5 and sl["wr"] == 0:
+        out.append(("trend_sl_atr_mult",
+                    min(4.0, get(symbol, "trend_sl_atr_mult") * 1.25),
+                    f"SL 0/{sl['n']} побед — расширить стоп TREND"))
+    
+    # 2) MFE≈0 на убытках + WR<30 -> входы мёртвые: ужесточить подтверждение
+    if m.get("avg_mfe", 0) < 0.003 and m.get("wr", 0) < 30:
+        out.append(("imbalance_confirmation_ticks",
+                    min(10, get(symbol, "imbalance_confirmation_ticks") + 2),
+                    "MFE≈0 на убытках — ужесточить подтверждение входа"))
+    
+    # 3) gross>0, net<=0 -> комиссии съедают: поднять порог трейлинга
+    if m.get("gross", 0) > 0 and m.get("net", 0) <= 0:
+        out.append(("trail_activation_pct",
+                    min(0.02, get(symbol, "trail_activation_pct") * 1.3),
+                    "gross>0 net<=0 — трейлинг отдаёт комиссии"))
+    
+    # 4) trailing gross>0 net<=0 -> дать прибыли дышать
+    if tr and tr["n"] >= 3 and tr["gross"] > 0 and tr["net"] <= 0:
+        out.append(("trend_trail_atr_mult",
+                    min(6.0, get(symbol, "trend_trail_atr_mult") * 1.2),
+                    "trailing gross>0 net<=0 — дать прибыли дышать"))
+    
+    # 5) TIME_STOP в минус -> сократить время мёртвых сделок
+    if ts and ts["n"] >= 2 and ts["net"] < 0:
+        out.append(("time_stop_seconds",
+                    max(300, int(get(symbol, "time_stop_seconds") * 0.7)),
+                    "TIME_STOP в минус — сократить тайм-стоп"))
+    
     return out[:2]
