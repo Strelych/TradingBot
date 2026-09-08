@@ -27,11 +27,11 @@ CONFIG={
  "max_daily_trades":0,"max_daily_commission":0.0,"daily_loss_halt_pct":0.0,
  "wall_volume_multiplier":6.0,"wall_min_age_seconds":60,"wall_persistence_check":5,
  "limit_order_offset_pct":0.0001,"order_timeout_seconds":60,
- "sl_behind_wall_pct":0.002,"min_sl_distance_pct":0.003,
- "be_threshold_pct":0.003,"trail_activation_pct":0.006,"trail_atr_mult":1.5,"trail_min_pct":0.005,
+ "sl_behind_wall_pct":0.002,"min_sl_distance_pct":0.004,
+ "be_threshold_pct":0.003,"trail_activation_pct":0.01,"trail_atr_mult":1.5,"trail_min_pct":0.006,
  "tp_atr_mult":3.0,"min_tp_pct":0.008,"tp_round_number_preference":True,
  "grace_seconds":2.0,"time_stop_seconds":900,
- "trend_sl_atr_mult":1.5,"trend_trail_atr_mult":2.0,"imbalance_threshold":0.5,"imbalance_confirmation_ticks":3,
+ "trend_sl_atr_mult":2.5,"trend_trail_atr_mult":2.0,"imbalance_threshold":0.5,"imbalance_confirmation_ticks":6,
  "trend_tp_pct":0.006,"trend_tp_atr_mult":2.0,
  "swing_sl_atr_mult":2.5,"swing_tp_atr_mult":4.0,"swing_time_stop":86400,"swing_risk_mult":0.75,
  "grid_levels":4,"grid_step_pct":0.004,"grid_tp_mult":1.2,
@@ -42,9 +42,9 @@ CONFIG={
  "min_atr_pct_abs":0.0016,"trading_hours_blacklist":[],
  "max_spread_pct":0.0006,"atr_period":14,
  "trend_price_tolerance_pct":0.005,
- "require_trend_alignment":True,"mtf_timeframes":["5","15"],"mtf_min_confirms":1,
+ "require_trend_alignment":True,"mtf_timeframes":["5","15"],"mtf_min_confirms":2,
  "adapter_hysteresis_count":3,"canary_fraction":0.25,
- "loss_cooldown_seconds":60,"min_atr_rel":0.4,"max_atr_rel":4.0,
+ "loss_cooldown_seconds":300,"min_atr_rel":0.4,"max_atr_rel":4.0,
  "adaptive_enabled":True,"min_sample":20,"hysteresis":21600,
  "commission_maker":0.00036,"commission_taker":0.001,
  "ema_period":20,"update_interval":0.2,"data_stale_threshold":5,
@@ -944,7 +944,10 @@ def manage_position(pos,px,atr,now):
         be_off=(ec+ex)/qty/entry
         bep=entry*(1+be_off) if side=="Buy" else entry*(1-be_off)
         pos["sl"]=max(pos["sl"],round_price(bep)) if side=="Buy" else min(pos["sl"],round_price(bep))
-    if tact<100 and prof>=tact and atr>0:
+    # Fee-aware трейлинг: не активировать, пока профит < round-trip fee × 1.5
+    round_trip_fee = CONFIG["commission_maker"] + CONFIG["commission_taker"]  # 0.00136
+    min_trail_profit = round_trip_fee * 1.5  # 0.00204 (0.2%)
+    if tact<100 and prof>=tact and atr>0 and prof>=min_trail_profit:
         td=max(px*tmin,atr*tmult)
         cand=round_price(px-td) if side=="Buy" else round_price(px+td)
         pos["sl"]=max(pos["sl"],cand) if side=="Buy" else min(pos["sl"],cand)
