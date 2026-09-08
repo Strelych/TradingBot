@@ -25,6 +25,7 @@ CONFIG={
  "margin_pct":0.1,"max_risk_pct":0.01,"max_notional":1000.0,"max_total_notional":1500.0,
  "max_open_positions":3,"max_pending_orders":12,
  "max_daily_trades":0,"max_daily_commission":0.0,"daily_loss_halt_pct":0.0,
+"sl_budget_ratio":0.64,"require_trend_alignment":True,
  "wall_volume_multiplier":6.0,"wall_min_age_seconds":60,"wall_persistence_check":5,
  "limit_order_offset_pct":0.0001,"order_timeout_seconds":60,
  "sl_behind_wall_pct":0.002,"min_sl_distance_pct":0.004,
@@ -729,6 +730,20 @@ def entry_allowed(symbol):
     if CONFIG["max_daily_commission"]>0 and state.daily_commission>=CONFIG["max_daily_commission"]:return False
     if CONFIG["daily_loss_halt_pct"]>0 and state.stats["daily_pnl"]<=-CONFIG["virtual_balance"]*CONFIG["daily_loss_halt_pct"]:return False
     if total_notional()>=CONFIG["max_total_notional"]:return False
+    
+    # SL-бюджет: SL <= 0.64 * TP за 72ч
+    now = time.time()
+    t0 = now - 72*3600
+    state.db_cursor.execute("SELECT exit_reason FROM trades WHERE timestamp>=?", (t0,))
+    reasons = [r[0] for r in state.db_cursor.fetchall()]
+    tp_count = sum(1 for r in reasons if r=="TAKE_PROFIT")
+    sl_count = sum(1 for r in reasons if r=="STOP_LOSS")
+    sl_budget = int(tp_count * CONFIG["sl_budget_ratio"])
+    
+    if sl_count > sl_budget + 5:  # превышение на 5+
+        log_warn_throttle(symbol, "sl_budget", f"SL {sl_count}/{sl_budget} за 72ч — авто-ужесточение", 300)
+        CONFIG["_auto_tight"] = time.time()
+    
     return True
 
 async def entry_wall(symbol,ob,mid,best_bid,best_ask,sr,trend1,mtf,imbalance,atr,sinfo):
@@ -1240,8 +1255,20 @@ async def websocket_endpoint(websocket:WebSocket):
 
 @app.get("/api/status")
 async def get_status():
+    # SL-бюджет (PR4 2.8)
+    now = time.time()
+    t0 = now - 72*3600
+    state.db_cursor.execute("SELECT exit_reason FROM trades WHERE timestamp>=?", (t0,))
+    reasons = [r[0] for r in state.db_cursor.fetchall()]
+    tp_count = sum(1 for r in reasons if r=="TAKE_PROFIT")
+    sl_count = sum(1 for r in reasons if r=="STOP_LOSS")
+    sl_budget = int(tp_count * CONFIG["sl_budget_ratio"])
+    
+    stats_copy = dict(state.stats)
+    stats_copy["sl_budget"] = {"tp": tp_count, "sl": sl_count, "budget": sl_budget}
+    
     return{"is_trading":state.is_trading,"symbols":CONFIG["symbols"],"ws_connected":state.ws_connected,
-           "stats":state.stats,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors,
+           "stats":stats_copy,"health":{"last_tick_age":round(time.time()-state.last_tick,2),"loop_errors":state.loop_errors,
            "rest_ok":_rest_state["ok"],"rest_fails":_rest_state["fails"],"rest_last_error":_rest_state["last_err"]},
            "version":VERSION}
 
