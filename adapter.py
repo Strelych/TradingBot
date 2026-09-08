@@ -124,6 +124,11 @@ class Adapter:
         
         strat,rm,reason=analyzer.decide_strategy(scores,reg,bo,current,stale,m,h1,h2,min_sample=min_sample,off_floor=off_floor)
         
+        # TASK_FIX_TRADE PR1: валидация стратегии + whitelist (exit_reason leak fix)
+        if strat not in ("WALL","TREND","SWING","GRID","BREAKOUT","OFF"):
+            reason=f"invalid strategy '{strat}' (exit_reason leak) -> TREND | "+reason
+            strat="TREND"
+        
         # Если decide_strategy вернул canary (rm=0.5), используем default_rm из режима
         if abs(rm - 0.5) < 1e-9 and strat != "OFF":
             rm = default_rm

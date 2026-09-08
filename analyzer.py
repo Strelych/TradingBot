@@ -96,16 +96,18 @@ def halves(rows):
     return trade_metrics(rows[:mid]), trade_metrics(rows[mid:])
 
 def perf_by_strategy(rows):
-    """Группировка метрик по exit_reason (STOP_LOSS, TAKE_PROFIT и т.д.)."""
+    """Группировка метрик по strategy (колонка 8), НЕ по exit_reason."""
     d={}
     for r in rows:
-        key = r[2] or "?"  # exit_reason - ключ для перформанса по причинам выхода
-        d.setdefault(key, []).append(r)
+        strat = r[8] or "?"  # r[8]=strategy, НЕ r[2]=exit_reason
+        d.setdefault(strat, []).append(r)
     return {s:trade_metrics(rs) for s,rs in d.items()}
 
 def strategy_scores(rows, min_n=3):
     out={}
+    VALID={"WALL","TREND","SWING","GRID","BREAKOUT"}
     for s,pm in perf_by_strategy(rows).items():
+        if s not in VALID: continue  # whitelist
         if pm["n"]==0: continue
         net_list = [r[0] for r in rows if r[8] == s]
         std = statistics.stdev(net_list) if len(net_list) > 1 else 1.0
