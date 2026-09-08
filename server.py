@@ -208,6 +208,13 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS session_stats(id INTEGER PRIMARY KEY CHECK(id=1),initial_balance REAL,
         current_balance REAL,total_trades INTEGER,winning_trades INTEGER,losing_trades INTEGER,
         total_pnl REAL,daily_pnl REAL,start_time REAL,last_updated REAL)""")
+    # PR2: таблица для персиста позиций при shutdown
+    c.execute("""CREATE TABLE IF NOT EXISTS open_positions(key TEXT PRIMARY KEY,
+        symbol TEXT, side TEXT, entry_price REAL, qty REAL, timestamp REAL, atr REAL,
+        sl REAL, tp REAL, strategy TEXT, margin_used REAL, notional REAL,
+        entry_commission REAL, wall_price REAL, wall_age REAL, entry_trend TEXT,
+        time_stop REAL, highest REAL, mfe REAL, mae REAL, spread_pct REAL,
+        atr_pct REAL, imbalance REAL, mtf5 TEXT, mtf15 TEXT)""")
     for sql in ["ALTER TABLE trades ADD COLUMN mfe REAL","ALTER TABLE trades ADD COLUMN mae REAL"]:
         try:c.execute(sql)
         except Exception:pass
@@ -415,15 +422,49 @@ def finalize_close(key,pos,px,reason,is_maker=False):
     logger.info(f"📈 #{state.stats['total_trades']} {pos['symbol']} {pos['strategy']} {reason} Net ${net:+.2f} | Баланс ${paper_engine.balance:.2f}")
     del state.open_positions[key]
 
+def save_open_positions():
+    """PR2: Сохранить открытые позиции в БД перед shutdown"""
+    if not state.db_conn: return
+    cur = state.db_conn.cursor()
+    cur.execute("DELETE FROM open_positions")
+    for key, pos in state.open_positions.items():
+        cur.execute("""INSERT INTO open_positions(key, symbol, side, entry_price, qty,
+            timestamp, atr, sl, tp, strategy, margin_used, notional, entry_commission,
+            wall_price, wall_age, entry_trend, time_stop, highest, mfe, mae,
+            spread_pct, atr_pct, imbalance, mtf5, mtf15)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (key, pos["symbol"], pos["side"], pos["entry_price"], pos["qty"],
+             pos["timestamp"], pos["atr"], pos["sl"], pos["tp"], pos["strategy"],
+             pos["margin_used"], pos["notional"], pos.get("entry_commission", 0),
+             pos.get("wall_price", 0), pos.get("wall_age", 0), pos.get("entry_trend", ""),
+             pos.get("time_stop", 0), pos.get("highest", 0), pos.get("mfe", 0), pos.get("mae", 0),
+             pos.get("spread_pct", 0), pos.get("atr_pct", 0), pos.get("imbalance", 0),
+             pos.get("mtf5", ""), pos.get("mtf15", "")))
+    state.db_conn.commit()
+
+def restore_open_positions():
+    """PR2: Восстановить открытые позиции из БД при startup"""
+    if not state.db_conn: return
+    cur = state.db_conn.cursor()
+    cur.execute("SELECT * FROM open_positions")
+    for row in cur.fetchall():
+        key = row[0]
+        state.open_positions[key] = {
+            "symbol": row[1], "side": row[2], "entry_price": row[3], "qty": row[4],
+            "timestamp": row[5], "atr": row[6], "sl": row[7], "tp": row[8],
+            "strategy": row[9], "margin_used": row[10], "notional": row[11],
+            "entry_commission": row[12], "wall_price": row[13], "wall_age": row[14],
+            "entry_trend": row[15], "time_stop": row[16], "highest": row[17],
+            "mfe": row[18], "mae": row[19], "spread_pct": row[20], "atr_pct": row[21],
+            "imbalance": row[22], "mtf5": row[23], "mtf15": row[24]
+        }
+    logger.info(f"✅ Восстановлено {len(state.open_positions)} позиций")
+
 def shutdown_cleanup():
-    for po in list(state.pending_orders):
-        paper_engine.cancel_order(po.margin,po.commission);state.pending_orders.remove(po)
-    for key in list(state.open_positions.keys()):
-        pos=state.open_positions[key]
-        ob=state.orderbooks.get(pos["symbol"],{})
-        px=max(ob["bids"]) if (pos["side"]=="Buy" and ob.get("bids")) else (min(ob["asks"]) if ob.get("asks") else None)
-        finalize_close(key,pos,px or pos["entry_price"],"SHUTDOWN_CLOSE")
-    state.sync_balance()
+    # PR2: персист позиций перед закрытием (НЕ закрывать taker'ом)
+    save_open_positions()
+    # НЕ закрывать позиции taker'ом — они будут восстановлены при рестарте
+    logger.info(f"💾 Сохранено {len(state.open_positions)} позиций для персиста")
 
 @asynccontextmanager
 async def lifespan(app):
@@ -435,6 +476,9 @@ async def lifespan(app):
     if not base_url.startswith("http"):
         logger.warning(f"⚠️ bybit_base_url невалиден ({base_url!r}) — восстановлен дефолт")
         CONFIG["bybit_base_url"] = "https://api.bybit.com"
+    
+    # PR2: Восстановление позиций из БД после рестарта
+    restore_open_positions()
     
     state.start_time=time.time();state.load_stats()
     paper_engine.balance=state.stats["virtual_balance"]
