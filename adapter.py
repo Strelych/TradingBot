@@ -324,6 +324,36 @@ class Adapter:
                         logger.error(f"  change[{i}]: {ch} (len={len(ch) if hasattr(ch, '__len__') else '?'})")
                     # Пропускаем запись изменений, но продолжаем работу
 
+        # --- Сторона по перформансу (PR4 2.5): Buy n>=3 и buy_gross<=0 и sell_gross>0 -> allowed_side=Sell ---
+        try:
+            if self.CONFIG.get("adaptive_enabled", True) and not self.CONFIG.get("locked_strict", False) and not locked:
+                buy_gross = m.get("buy_gross", 0)
+                sell_gross = m.get("sell_gross", 0)
+                buy_n = len([r for r in rows if r[3]=="Buy"])
+                sell_n = len([r for r in rows if r[3]=="Sell"])
+                
+                desired_side = "BOTH"
+                if buy_n >= 3 and buy_gross <= 0 and sell_gross > 0:
+                    desired_side = "Sell"
+                elif sell_n >= 3 and sell_gross <= 0 and buy_gross > 0:
+                    desired_side = "Buy"
+                
+                cur_side = ov.get("allowed_side", "BOTH")
+                if desired_side != cur_side:
+                    # Кулдаун 6ч
+                    self.kn_cur.execute("SELECT ts FROM adaptive_log WHERE symbol=? AND param='allowed_side' ORDER BY ts DESC LIMIT 1", (symbol,))
+                    last_row = self.kn_cur.fetchone()
+                    last_ts = float(last_row[0]) if last_row else 0
+                    if time.time() - last_ts >= 6*3600:
+                        old = cur_side
+                        ov["allowed_side"] = desired_side
+                        self.log(symbol, "allowed_side", old, desired_side,
+                                 f"performance: buy_gross={buy_gross:.2f}, sell_gross={sell_gross:.2f}, buy_n={buy_n}, sell_n={sell_n}")
+                        self.bump(f"side {symbol}")
+                        self.config_api._save()
+        except Exception:
+            pass
+        
         # --- Adaptive allowed_side по 1h EMA-slope (>=3 подряд) ---
         try:
             if self.CONFIG.get("adaptive_enabled", True) and not self.CONFIG.get("locked_strict", False) and not locked:
@@ -519,23 +549,35 @@ class Adapter:
                             self.config_api._save()
                 self.kn_conn.commit()
                 
-                # --- Часовая адаптация (раз в 6ч): токсичные часы -> blacklist
-                if time.time() - self.last_hour_adapt > 6*3600:
+                # --- Часовая адаптация (раз в 1ч): токсичные часы -> blacklist (PR4 2.7) ---
+                if time.time() - self.last_hour_adapt > 3600:  # раз в 1ч вместо 6ч
                     self.last_hour_adapt = time.time()
                     for sym in self.CONFIG.get("symbols",[]):
                         ov = self.CONFIG.setdefault("pair_overrides",{}).get(sym,{})
                         if ov.get("locked"): continue
                         rows = analyzer.get_rows(self.state.db_conn, sym, 72)
-                        hours = analyzer.hour_stats(rows, worst=5)
+                        hours = analyzer.hour_stats(rows, worst=10)  # топ-10 вместо 5
                         toxic_hours = [h["h"] for h in hours if h["net"] < -0.5 and h["n"] >= 3]
-                        if toxic_hours:
-                            current_blacklist = ov.get("trading_hours_blacklist", [])
-                            new_blacklist = list(set(current_blacklist + toxic_hours))
-                            if new_blacklist != current_blacklist:
-                                ov["trading_hours_blacklist"] = new_blacklist
-                                self.log(sym, "trading_hours_blacklist", current_blacklist, new_blacklist, f"часовая адаптация: токсичные {toxic_hours}")
-                                self.bump(f"часы {sym}")
-                                self.config_api._save()
+                        
+                        current_blacklist = ov.get("trading_hours_blacklist", [])
+                        new_blacklist = list(set(current_blacklist + toxic_hours))
+                        
+                        # Снятие часов: net > 0 за последние 24ч
+                        now = time.time()
+                        for h in list(new_blacklist):
+                            self.state.db_cursor.execute("""SELECT pnl FROM trades
+                                WHERE symbol=? AND timestamp>=? AND strftime('%H', datetime(timestamp, 'unixepoch'))=?""",
+                                (sym, now - 86400, str(h).zfill(2)))
+                            hour_pnl = sum(r[0] for r in self.state.db_cursor.fetchall())
+                            if hour_pnl > 0:
+                                new_blacklist.remove(h)
+                        
+                        if new_blacklist != current_blacklist:
+                            ov["trading_hours_blacklist"] = new_blacklist
+                            self.log(sym, "trading_hours_blacklist", current_blacklist, new_blacklist,
+                                     f"часовая адаптация: +{toxic_hours}, сняты с net>0")
+                            self.bump(f"часы {sym}")
+                            self.config_api._save()
                 
                 # --- Авто-ребаланс убыточных пар (раз в 24ч): 8/10 убыточных -> OFF на 24ч
                 if time.time() - self.last_rebalance_check > 24*3600:
